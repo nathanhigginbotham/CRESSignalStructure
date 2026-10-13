@@ -37,6 +37,9 @@ class CoilField(BaseField):
         self.current = current
         self.z = Z
 
+    def _memo_fingerprint(self):
+        return ('CoilField', float(self.radius), float(self.current), float(self.z))
+
     def __central_field(self) -> float:
         return self.current * sc.mu_0 / self.radius / 2.0
 
@@ -148,6 +151,11 @@ class BathtubField(BaseField):
             radius, current, Z1, Z2, np.linalg.norm(background)
         )
 
+    def _memo_fingerprint(self):
+        return ('BathtubField', self.coil1._memo_fingerprint(),
+                self.coil2._memo_fingerprint(),
+                tuple(float(v) for v in np.ravel(self.background)))
+
     def evaluate_field(self, x: ArrayLike, y: ArrayLike, z: ArrayLike) -> tuple:
         b_x1, b_y1, b_z1 = self.coil1.evaluate_field(x, y, z)
         b_x2, b_y2, b_z2 = self.coil2.evaluate_field(x, y, z)
@@ -202,6 +210,10 @@ class HarmonicField(BaseField):
             "B_background=%.3f T",
             radius, current, background
         )
+
+    def _memo_fingerprint(self):
+        return ('HarmonicField', self.coil._memo_fingerprint(),
+                tuple(float(v) for v in np.ravel(self.background)))
 
     def evaluate_field(self, x: ArrayLike, y: ArrayLike, z: ArrayLike) -> tuple:
         b_x_coil, b_y_coil, b_z_coil = self.coil.evaluate_field(x, y, z)

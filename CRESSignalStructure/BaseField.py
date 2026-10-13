@@ -6,6 +6,7 @@ fields.
 """
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from typing import Optional
@@ -13,6 +14,29 @@ from .Particle import Particle
 from scipy.integrate import simpson, cumulative_simpson
 import scipy.constants as sc
 from scipy.interpolate import interp1d
+
+
+def _particle_state_key(particle: Particle) -> tuple:
+    """
+    Hashable key identifying a particle's kinematic state for memoisation.
+
+    Two particles with identical type, energy, position, pitch angle, charge
+    and mass give identical field-line quantities, so they share cache entries.
+    """
+    pos = np.asarray(particle.get_position(), dtype=float)
+    return (type(particle), float(particle.get_energy()),
+            tuple(float(v) for v in pos.ravel()),
+            float(particle.get_pitch_angle()), float(particle.get_charge()),
+            float(particle.get_mass()))
+
+
+def _copy_result(value):
+    """Return a defensive copy of cached arrays so callers cannot corrupt the cache."""
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, tuple):
+        return tuple(_copy_result(v) for v in value)
+    return value
 
 
 class BaseField(ABC):
@@ -26,6 +50,67 @@ class BaseField(ABC):
 
     evaluate_field_magnitude(x, y, z): Evaluate field magnitude for a position or positions
     """
+
+    @contextmanager
+    def memoised(self, store: Optional[dict] = None):
+        """
+        Context manager enabling memoisation of per-particle field-line results
+
+        Inside the context, calc_z_max, calc_omega_axial, calc_t_vs_z,
+        b_from_t, calc_omega_0 and cyclotron_phase_from_t are computed at most
+        once per (particle state, arguments) and reused. The cached values are
+        the results of exactly the same operations, so outputs are bitwise
+        identical to the uncached path. Outside any context nothing is cached.
+        Contexts nest; the outermost store is restored on exit.
+
+        Parameters
+        ----------
+        store : dict, optional
+            Dictionary used as the cache. Passing the same dictionary to
+            several contexts shares cached results between them.
+
+        Yields
+        ------
+        dict
+            The active cache dictionary
+        """
+        had_previous = '_memo_store' in self.__dict__
+        previous = self.__dict__.get('_memo_store')
+        self._memo_store = {} if store is None else store
+        try:
+            yield self._memo_store
+        finally:
+            if had_previous:
+                self._memo_store = previous
+            else:
+                del self.__dict__['_memo_store']
+
+    def _memo_fingerprint(self):
+        """
+        Hashable summary of the field configuration, included in cache keys so
+        that a field mutated while a cache is live does not return stale values.
+        Subclasses with mutable parameters should override this.
+        """
+        return None
+
+    def _memo_call(self, name: str, particle: Particle, args: tuple, compute):
+        """Evaluate compute() once per key while a memoised() context is active."""
+        store = self.__dict__.get('_memo_store')
+        if store is None:
+            return compute()
+        try:
+            key = (name, self._memo_fingerprint(), _particle_state_key(particle), args)
+            hash(key)
+        except Exception:
+            # Particle-like objects without the full getter API are never cached
+            return compute()
+        if key not in store:
+            store[key] = compute()
+        return _copy_result(store[key])
+
+    def _calc_z_max_cached(self, particle: Particle) -> float:
+        return self._memo_call('z_max', particle, (),
+                               lambda: self.calc_z_max(particle))
 
     @abstractmethod
     def evaluate_field(self, x: ArrayLike, y: ArrayLike, z: ArrayLike) -> tuple:
@@ -149,6 +234,12 @@ class BaseField(ABC):
         float
             The average cyclotron frequency in radians/s
         """
+        return self._memo_call(
+            'omega_0', particle, (n_t_points,),
+            lambda: self._calc_omega_0_uncached(particle, n_t_points))
+
+    def _calc_omega_0_uncached(self, particle: Particle, n_t_points: int = 499) -> float:
+        """Uncached implementation of calc_omega_0."""
         if particle.get_pitch_angle() == np.pi/2:
             pos = particle.get_position()
             B0 = self.evaluate_field_magnitude(pos[0], pos[1], pos[2])
@@ -175,6 +266,12 @@ class BaseField(ABC):
         tuple[NDArray, NDArray]
             Time values in seconds, Field magnitudes in Tesla
         """
+        return self._memo_call(
+            'b_from_t', particle, (n_t_points,),
+            lambda: self._b_from_t_uncached(particle, n_t_points))
+
+    def _b_from_t_uncached(self, particle: Particle, n_t_points: int):
+        """Uncached implementation of b_from_t."""
         if (n_t_points < 2):
             raise ValueError("Require at least 2 time points")
 
@@ -205,6 +302,13 @@ class BaseField(ABC):
         tuple[NDArray, NDArray]
             Time values in seconds, cumulative phase in radians
         """
+        return self._memo_call(
+            'cyclotron_phase', particle, (n_t_points,),
+            lambda: self._cyclotron_phase_from_t_uncached(particle, n_t_points))
+
+    def _cyclotron_phase_from_t_uncached(self, particle: Particle,
+                                         n_t_points: int = 499) -> tuple[NDArray, NDArray]:
+        """Uncached implementation of cyclotron_phase_from_t."""
         t, B = self.b_from_t(particle, n_t_points)
         return t, cumulative_simpson(
             sc.e * B / (particle.get_gamma() * particle.get_mass()), x=t, initial=0.0)
@@ -226,6 +330,13 @@ class BaseField(ABC):
         float
             Axial frequency in radians/s
         """
+        return self._memo_call(
+            'omega_axial', particle, (n_points,),
+            lambda: self._calc_omega_axial_uncached(particle, n_points))
+
+    def _calc_omega_axial_uncached(self, particle: Particle,
+                                   n_points: int = 50000) -> float:
+        """Uncached implementation of calc_omega_axial."""
         pa = particle.get_pitch_angle()
         gamma = particle.get_gamma()
         p0 = gamma * particle.get_mass() * particle.get_speed()
@@ -233,7 +344,7 @@ class BaseField(ABC):
         rho_0 = np.sqrt(pStart[0]**2 + pStart[1]**2)
 
         centralField = self.evaluate_field_magnitude(pStart[0], pStart[1], 0.)
-        zMax = self.calc_z_max(particle)
+        zMax = self._calc_z_max_cached(particle)
 
         # Equivalent magnetic moment
         muMag = gamma * particle.get_mass() * (np.sin(pa) * particle.get_speed())**2 / \
@@ -278,6 +389,14 @@ class BaseField(ABC):
         tuple[NDArray, NDArray]
             Time values in seconds, z values in metres
         """
+        return self._memo_call(
+            't_vs_z', particle, (axial_period, n_points),
+            lambda: self._calc_t_vs_z_uncached(particle, axial_period, n_points))
+
+    def _calc_t_vs_z_uncached(self, particle: Particle,
+                              axial_period: Optional[float] = None,
+                              n_points: int = 10000) -> tuple[NDArray, NDArray]:
+        """Uncached implementation of calc_t_vs_z."""
 
         pa = particle.get_pitch_angle()
         gamma = particle.get_gamma()
@@ -286,7 +405,7 @@ class BaseField(ABC):
         rho_0 = np.sqrt(pStart[0]**2 + pStart[1]**2)
 
         centralField = self.evaluate_field_magnitude(pStart[0], pStart[1], 0.)
-        zMax = self.calc_z_max(particle)
+        zMax = self._calc_z_max_cached(particle)
         muMag = gamma * particle.get_mass() * (np.sin(pa) * particle.get_speed())**2 / \
             (2 * centralField)
 
