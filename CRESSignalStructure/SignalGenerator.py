@@ -18,6 +18,12 @@ import scipy.constants as sc
 
 logger = logging.getLogger(__name__)
 
+# Synthesis constants shared with BatchedSignalGenerator so the two paths
+# cannot drift apart
+FAST_SAMPLE_FACTOR = 5      # oversampling of the analogue stage
+FILTER_ORDER = 8            # Butterworth anti-alias filter order
+IMPEDANCE = 50.0            # Ohms
+
 
 class SignalGenerator:
     def __init__(self, spectrum_calc: SpectrumCalculator,
@@ -80,12 +86,50 @@ class SignalGenerator:
         if max_order < 0 or not np.isfinite(max_order):
             raise ValueError("max_order must be finite and >= 0")
 
-        FAST_SAMPLE_FACTOR = 5
         FAST_SAMPLE_FREQ = FAST_SAMPLE_FACTOR * self.__sample_rate
         N_SAMPLES = int(self.__acq_time * FAST_SAMPLE_FREQ)
         times_fast_sample = np.arange(N_SAMPLES) / FAST_SAMPLE_FREQ
 
-        # Get the fourier amplitudes and frequencies, applying initial phases
+        fourier_freqs, fourier_amps, chirp_rate_ang, power_norm = \
+            self.get_tone_parameters(max_order, phi_c, phi_a)
+
+        # Generate the LO signal for I/Q demodulation and add in the chirp.
+        # chirp_rate_ang is d(omega)/dt, so the phase of a linear chirp is
+        # 0.5 * d(omega)/dt * t^2.
+        lo_signal = np.exp(-2j * np.pi * self.__lo_freq * times_fast_sample)
+        rf_signal_dm = np.sum(fourier_amps[:, np.newaxis] * np.exp(2j * np.pi * fourier_freqs[:, np.newaxis]
+                              * times_fast_sample), axis=0) * lo_signal * np.exp(0.5j * chirp_rate_ang * times_fast_sample**2)
+
+        # Generate a Butterworth filter and filter the signal
+        sos = butter(N=FILTER_ORDER, Wn=self.__sample_rate / 2, btype='low',
+                     output='sos', fs=self.__sample_rate * FAST_SAMPLE_FACTOR)
+        rf_signal_filtered = sosfiltfilt(sos, rf_signal_dm) * np.sqrt(IMPEDANCE)
+
+        # Return reduced signal
+        return times_fast_sample[::FAST_SAMPLE_FACTOR], rf_signal_filtered[::FAST_SAMPLE_FACTOR] * np.sqrt(power_norm)
+
+    def get_tone_parameters(self, max_order: int, phi_c: float = 0.0,
+                            phi_a: float = 0.0) -> tuple[NDArray, NDArray, float, float]:
+        """
+        Per-event spectral content used by generate_signal
+
+        Parameters
+        ----------
+        max_order : int
+            Maximum order of sideband to calculate
+        phi_c : float
+            Initial cyclotron phase in radians (default 0.0)
+        phi_a : float
+            Initial axial phase in radians (default 0.0)
+
+        Returns
+        -------
+        tuple[NDArray, NDArray, float, float]
+            Tone frequencies in Hertz (orders -max_order..max_order, then
+            their negative-frequency partners), phase-shifted complex tone
+            amplitudes, chirp rate d(omega)/dt in rad/s^2, and the power
+            normalisation in Watts
+        """
         orders = np.arange(-max_order, max_order+1, 1)
         fourier_freqs = self.__spec_calc.get_peak_frequency(orders, False)
         fourier_freqs = np.append(
@@ -109,18 +153,4 @@ class SignalGenerator:
             (sc.m_e * sc.c**2)  # radians per second squared
         logger.debug("Chirp rate: %.3e rad/s^2", chirp_rate_ang)
 
-        # Generate the LO signal for I/Q demodulation and add in the chirp.
-        # chirp_rate_ang is d(omega)/dt, so the phase of a linear chirp is
-        # 0.5 * d(omega)/dt * t^2.
-        lo_signal = np.exp(-2j * np.pi * self.__lo_freq * times_fast_sample)
-        rf_signal_dm = np.sum(fourier_amps[:, np.newaxis] * np.exp(2j * np.pi * fourier_freqs[:, np.newaxis]
-                              * times_fast_sample), axis=0) * lo_signal * np.exp(0.5j * chirp_rate_ang * times_fast_sample**2)
-
-        # Generate a Butterworth filter and filter the signal
-        sos = butter(N=8, Wn=self.__sample_rate / 2, btype='low', output='sos',
-                     fs=self.__sample_rate * FAST_SAMPLE_FACTOR)
-        IMPEDANCE = 50.0  # Ohms
-        rf_signal_filtered = sosfiltfilt(sos, rf_signal_dm) * np.sqrt(IMPEDANCE)
-
-        # Return reduced signal
-        return times_fast_sample[::FAST_SAMPLE_FACTOR], rf_signal_filtered[::FAST_SAMPLE_FACTOR] * np.sqrt(self.__spec_calc.get_power_norm())
+        return fourier_freqs, fourier_amps, chirp_rate_ang, self.__spec_calc.get_power_norm()
