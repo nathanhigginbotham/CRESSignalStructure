@@ -149,20 +149,24 @@ def _process_results(results_iterator: Iterator[Any], n_events: int,
                         i + 1, n_events, rate)
 
 
-# --- Helper Wrapper for Uniform Sampling ---
-def generate_uniform_ensemble(output_file: str,
-                              n_events: int,
-                              trap: BaseTrap | BaseField,
-                              waveguide: CircularWaveguide,
-                              sim_config: dict,
-                              ranges: dict,
-                              fft_output_file: str | None = None,
-                              use_multiprocessing: bool = True,
-                              verbose: bool = True,
-                              seed: int | None = None) -> None:
+def make_uniform_particle_generator(ranges: dict,
+                                    rng: np.random.Generator) -> Callable[[int], Particle]:
+    """
+    Particle generator used by generate_uniform_ensemble
 
-    rng = np.random.default_rng(seed)
+    Parameters
+    ----------
+    ranges : dict
+        Sampling ranges ('energy', 'pitch', 'z', 'r', 'theta'), as for
+        generate_uniform_ensemble
+    rng : np.random.Generator
+        Random number generator; particles depend on the order of calls
 
+    Returns
+    -------
+    Callable[[int], Particle]
+        Function(index) -> Particle
+    """
     def uniform_particle_generator(i):
         e_min, e_max = ranges.get('energy', (18500.0, 18600.0))
         p_min, p_max = ranges.get('pitch', (np.radians(88), np.radians(89.99)))
@@ -184,6 +188,24 @@ def generate_uniform_ensemble(output_file: str,
         pos = np.array([r * np.cos(theta), r * np.sin(theta), z])
         
         return Particle(ke=ke, startPos=pos, pitchAngle=pitch)
+
+    return uniform_particle_generator
+
+
+# --- Helper Wrapper for Uniform Sampling ---
+def generate_uniform_ensemble(output_file: str,
+                              n_events: int,
+                              trap: BaseTrap | BaseField,
+                              waveguide: CircularWaveguide,
+                              sim_config: dict,
+                              ranges: dict,
+                              fft_output_file: str | None = None,
+                              use_multiprocessing: bool = True,
+                              verbose: bool = True,
+                              seed: int | None = None) -> None:
+
+    rng = np.random.default_rng(seed)
+    uniform_particle_generator = make_uniform_particle_generator(ranges, rng)
 
     generate_ensemble(
         output_file=output_file,
