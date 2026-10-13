@@ -96,25 +96,53 @@ class ToneBatch:
         Chirp rates d(omega)/dt in rad/s^2, shape (n_events,)
     power_norms : NDArray
         Power normalisation in Watts, shape (n_events,)
+    mean_freqs, axial_freqs : NDArray, optional
+        Orbit-averaged cyclotron and axial frequencies in Hertz, shape
+        (n_events,), the truth labels written by CRESWriter
     """
     freqs: NDArray
     amps: NDArray
     chirp_rates: NDArray
     power_norms: NDArray
+    mean_freqs: Optional[NDArray] = None
+    axial_freqs: Optional[NDArray] = None
 
     def __len__(self) -> int:
         return self.freqs.shape[0]
 
     def slice(self, start: int, stop: int) -> "ToneBatch":
+        cut = lambda a: None if a is None else a[start:stop]
         return ToneBatch(self.freqs[start:stop], self.amps[start:stop],
-                         self.chirp_rates[start:stop], self.power_norms[start:stop])
+                         self.chirp_rates[start:stop], self.power_norms[start:stop],
+                         cut(self.mean_freqs), cut(self.axial_freqs))
+
+
+def _tone_worker_or_none(args) -> Optional[tuple]:
+    """_tone_worker, returning None instead of raising (e.g. untrapped or
+    edge-of-trap particles whose orbit integrals fail)"""
+    try:
+        return _tone_worker(args)
+    except Exception as exc:
+        logger.warning("Tone parameters failed for a particle: %s", exc)
+        return None
 
 
 def _tone_worker(args) -> tuple:
     particle, trap, waveguide, sample_rate, lo_freq, acq_time, max_order, phi_c, phi_a = args
-    sig_gen = SignalGenerator(SpectrumCalculator(trap, waveguide, particle),
-                              sample_rate, lo_freq, acq_time)
-    return sig_gen.get_tone_parameters(max_order, phi_c, phi_a)
+    spec = SpectrumCalculator(trap, waveguide, particle)
+    sig_gen = SignalGenerator(spec, sample_rate, lo_freq, acq_time)
+    tones = sig_gen.get_tone_parameters(max_order, phi_c, phi_a)
+    # Truth labels from the same memoised orbit integrals the tones used, so
+    # they cost nothing extra and equal what CRESWriter would compute.
+    with spec._field_memo_scope():
+        if isinstance(trap, BaseTrap):
+            v, pa = particle.get_speed(), particle.get_pitch_angle()
+            f_mean = float(trap.calc_omega_0(v, pa) / (2 * np.pi))
+            f_ax = float(trap.calc_omega_axial(v, pa) / (2 * np.pi))
+        else:
+            f_mean = float(trap.calc_omega_0(particle) / (2 * np.pi))
+            f_ax = float(trap.calc_omega_axial(particle) / (2 * np.pi))
+    return (*tones, f_mean, f_ax)
 
 
 def _broadcast_phases(phi: ArrayLike | float | None, n: int) -> NDArray:
@@ -176,7 +204,9 @@ def compute_tone_parameters(particles: Sequence[Particle],
     return ToneBatch(freqs=np.array([r[0] for r in results], dtype=np.float64),
                      amps=np.array([r[1] for r in results], dtype=np.complex128),
                      chirp_rates=np.array([r[2] for r in results], dtype=np.float64),
-                     power_norms=np.array([r[3] for r in results], dtype=np.float64))
+                     power_norms=np.array([r[3] for r in results], dtype=np.float64),
+                     mean_freqs=np.array([r[4] for r in results], dtype=np.float64),
+                     axial_freqs=np.array([r[5] for r in results], dtype=np.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +655,7 @@ def generate_ensemble_batched(output_file: str,
                               batch_size: int = 64,
                               n_workers: int = 1,
                               verbose: bool = True,
-                              **synth_kwargs) -> None:
+                              **synth_kwargs) -> int:
     """
     Batched counterpart of EnsembleGenerator.generate_ensemble
 
@@ -667,6 +697,7 @@ def generate_ensemble_batched(output_file: str,
         pool = stack.enter_context(mp.Pool(processes=n_workers)) if n_workers > 1 else None
 
         done = 0
+        n_failed = 0
         for b0 in range(0, n_events, batch_size):
             idx = range(b0, min(n_events, b0 + batch_size))
             particles = [particle_generator(i) for i in idx]
@@ -675,13 +706,41 @@ def generate_ensemble_batched(output_file: str,
             else:
                 phases = np.array([phase_generator(i) for i in idx], dtype=float)
                 pc, pa = phases[:, 0], phases[:, 1]
-            tones = compute_tone_parameters(
-                particles, trap, waveguide, sim_config['sample_rate'],
-                sim_config['lo_freq'], sim_config['acq_time'],
-                sim_config['max_order'], pc, pa, pool=pool)
+            pcb = _broadcast_phases(pc, len(particles))
+            pab = _broadcast_phases(pa, len(particles))
+            args = [(p, trap, waveguide, sim_config['sample_rate'], sim_config['lo_freq'],
+                     sim_config['acq_time'], sim_config['max_order'],
+                     float(pcb[j]), float(pab[j])) for j, p in enumerate(particles)]
+            results = (pool.map(_tone_worker_or_none, args) if pool is not None
+                       else [_tone_worker_or_none(a) for a in args])
+            # Events whose physics fails are dropped and logged rather than
+            # aborting the whole file (the legacy pool path also skips them).
+            ok = [j for j, r in enumerate(results) if r is not None]
+            if len(ok) < len(particles):
+                n_failed += len(particles) - len(ok)
+                logger.warning("Dropped %d event(s) in batch starting at %d",
+                               len(particles) - len(ok), b0)
+            if not ok:
+                continue
+            particles = [particles[j] for j in ok]
+            results = [results[j] for j in ok]
+            tones = ToneBatch(freqs=np.array([r[0] for r in results], dtype=np.float64),
+                              amps=np.array([r[1] for r in results], dtype=np.complex128),
+                              chirp_rates=np.array([r[2] for r in results], dtype=np.float64),
+                              power_norms=np.array([r[3] for r in results], dtype=np.float64),
+                              mean_freqs=np.array([r[4] for r in results], dtype=np.float64),
+                              axial_freqs=np.array([r[5] for r in results], dtype=np.float64))
             signals = synth.synthesise(tones)
-            for p, sig in zip(particles, signals):
-                writer.write_event(p, synth.times, sig)
+            pcw = [None] * len(ok) if pc is None else [float(pcb[j]) for j in ok]
+            paw = [None] * len(ok) if pa is None else [float(pab[j]) for j in ok]
+            for j, (p, sig) in enumerate(zip(particles, signals)):
+                if not np.all(np.isfinite(sig)):
+                    n_failed += 1
+                    logger.warning("Dropped event with non-finite signal in batch starting at %d", b0)
+                    continue
+                writer.write_event(p, synth.times, sig, phi_c=pcw[j], phi_a=paw[j],
+                                   f_cyc_mean=float(tones.mean_freqs[j]),
+                                   f_axial=float(tones.axial_freqs[j]))
                 if fft_writer:
                     freqs, power = _fft_power(sig, sample_rate)
                     fft_writer.write_event(p, freqs, power)
@@ -689,7 +748,8 @@ def generate_ensemble_batched(output_file: str,
             if verbose:
                 rate = done / (time.time() - start)
                 logger.info("  Processed %d/%d events (%.1f ev/s)...", done, n_events, rate)
-    logger.info("Done! Saved to %s", output_file)
+    logger.info("Done! Saved to %s (%d event(s) dropped)", output_file, n_failed)
+    return n_failed
 
 
 def generate_uniform_ensemble_batched(output_file: str,
@@ -704,7 +764,7 @@ def generate_uniform_ensemble_batched(output_file: str,
                                       device: str = "cpu",
                                       batch_size: int = 64,
                                       n_workers: int = 1,
-                                      **synth_kwargs) -> None:
+                                      **synth_kwargs) -> int:
     """
     Batched counterpart of EnsembleGenerator.generate_uniform_ensemble
 
@@ -722,7 +782,7 @@ def generate_uniform_ensemble_batched(output_file: str,
     """
     from .EnsembleGenerator import make_uniform_particle_generator
     rng = np.random.default_rng(seed)
-    generate_ensemble_batched(
+    return generate_ensemble_batched(
         output_file=output_file, n_events=n_events,
         particle_generator=make_uniform_particle_generator(ranges, rng),
         trap=trap, waveguide=waveguide, sim_config=sim_config,

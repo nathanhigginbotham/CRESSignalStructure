@@ -122,3 +122,40 @@ def test_float64_enforced(setup):
         synth.synthesise(bad)
     with pytest.raises(ValueError, match="MPS"):
         BatchedSynthesiser(SAMPLE_RATE, lo, ACQ_TIME, device="mps")
+
+
+def test_ensemble_writer_truth_labels_and_phases(setup, tmp_path):
+    """Batched writer stores the orbit-averaged carrier, axial frequency and
+    initial phases, equal to what CRESWriter computes from the trap."""
+    field, wg, particles, phi_c, phi_a, lo, refs = setup
+    cfg = {'sample_rate': SAMPLE_RATE, 'lo_freq': lo, 'acq_time': ACQ_TIME,
+           'max_order': MAX_ORDER}
+    out = tmp_path / "sig.h5"
+    generate_ensemble_batched(str(out), 3, lambda i: particles[i], field, wg, cfg,
+                              phase_generator=lambda i: (phi_c[i], phi_a[i]),
+                              batch_size=2, verbose=False)
+    with h5py.File(out) as f:
+        for i, p in enumerate(particles):
+            a = f['Data'][f'signal{i + 1}'].attrs
+            f_mean = field.calc_omega_0(p) / (2 * np.pi)
+            assert a['Mean cyclotron frequency [Hertz]'] == f_mean
+            assert a['Mean downmixed cyclotron frequency [Hertz]'] == abs(f_mean - lo)
+            assert a['Axial frequency [Hertz]'] == field.calc_omega_axial(p) / (2 * np.pi)
+            assert a['Cyclotron phase [rad]'] == phi_c[i]
+            assert a['Axial phase [rad]'] == phi_a[i]
+            assert np.array_equal(f['Data'][f'signal{i + 1}'][()], refs[i][1].astype('complex64'))
+
+
+def test_ensemble_writer_drops_failed_events(setup, tmp_path):
+    """A particle whose physics raises is dropped; the rest are written."""
+    field, wg, particles, _, _, lo, _ = setup
+    cfg = {'sample_rate': SAMPLE_RATE, 'lo_freq': lo, 'acq_time': ACQ_TIME,
+           'max_order': MAX_ORDER}
+    untrapped = Electron(18550.0, np.array([0.0, 0.0, 0.0]), float(np.radians(10.0)))
+    pool = [particles[0], untrapped, particles[1]]
+    out = tmp_path / "sig.h5"
+    n_failed = generate_ensemble_batched(str(out), 3, lambda i: pool[i], field, wg, cfg,
+                                         batch_size=3, verbose=False)
+    with h5py.File(out) as f:
+        assert n_failed == 1
+        assert len(f['Data']) == 2

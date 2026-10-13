@@ -73,11 +73,41 @@ class CRESWriter:
 
         return params
 
-    def write_event(self, particle: Particle, 
-                    time_array: np.ndarray, 
-                    signal_array: np.ndarray):
+    def _mean_freqs(self, particle: Particle) -> tuple:
+        """
+        Orbit-averaged cyclotron frequency <f_c> and axial frequency, in Hz
+
+        <f_c> is the carrier the FFT parks on: a phase-modulated tone sits at
+        <f_inst>, not at f_c(z=0). Returns (nan, nan) if the trap cannot
+        evaluate the orbit (e.g. the particle is not trapped).
+        """
+        try:
+            if isinstance(self._trap, BaseTrap):
+                v = particle.get_speed()
+                pa = particle.get_pitch_angle()
+                return (float(self._trap.calc_omega_0(v, pa) / (2 * np.pi)),
+                        float(self._trap.calc_omega_axial(v, pa) / (2 * np.pi)))
+            return (float(self._trap.calc_omega_0(particle) / (2 * np.pi)),
+                    float(self._trap.calc_omega_axial(particle) / (2 * np.pi)))
+        except Exception:
+            return float('nan'), float('nan')
+
+    def write_event(self, particle: Particle,
+                    time_array: np.ndarray,
+                    signal_array: np.ndarray,
+                    phi_c: float = None,
+                    phi_a: float = None,
+                    f_cyc_mean: float = None,
+                    f_axial: float = None):
         """
         Writes a single event with the exact legacy attribute structure.
+
+        Also writes the orbit-averaged ('Mean') cyclotron frequency and the
+        axial frequency, which are the observable truth labels. Callers that
+        already hold them (the batched generator computes them alongside the
+        tone parameters) pass f_cyc_mean and f_axial to avoid recomputing the
+        orbit integrals; otherwise they are computed here. phi_c / phi_a, if
+        given, are stored as the initial cyclotron and axial phases.
         """
         if self.file is None or self._config is None or self._trap is None:
             raise RuntimeError("CRESWriter must be used within a 'with' statement and set_global_config must be called first.")
@@ -149,6 +179,15 @@ class CRESWriter:
 
         attrs['Cyclotron frequency [Hertz]'] = f_cyc
         attrs['Downmixed cyclotron frequency [Hertz]'] = abs(f_cyc - f_lo)
+        if f_cyc_mean is None or f_axial is None:
+            f_cyc_mean, f_axial = self._mean_freqs(particle)
+        attrs['Mean cyclotron frequency [Hertz]'] = f_cyc_mean
+        attrs['Mean downmixed cyclotron frequency [Hertz]'] = abs(f_cyc_mean - f_lo)
+        attrs['Axial frequency [Hertz]'] = f_axial
+        if phi_c is not None:
+            attrs['Cyclotron phase [rad]'] = phi_c
+        if phi_a is not None:
+            attrs['Axial phase [rad]'] = phi_a
         attrs['Energy [eV]'] = particle.get_energy()
         attrs['LO frequency [Hertz]'] = f_lo
         attrs['Pitch angle [degrees]'] = np.degrees(pitch)
