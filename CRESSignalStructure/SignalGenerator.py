@@ -100,15 +100,21 @@ class SignalGenerator:
         beta = self.__spec_calc.get_particle().get_beta()
         gamma = self.__spec_calc.get_particle().get_gamma()
         central_freq = self.__spec_calc.get_peak_frequency(0)
-        chirp_rate_ang = sc.e**2 * (2 * np.pi * central_freq)**3 * gamma * \
+        # d(omega)/dt = (omega / gamma) * P / (m c^2), with the relativistic
+        # Larmor power P = e^2 omega^2 beta^2 gamma^4 / (6 pi eps0 c) written
+        # in terms of the actual (relativistic) cyclotron frequency omega.
+        # Together these give gamma^3.
+        chirp_rate_ang = sc.e**2 * (2 * np.pi * central_freq)**3 * gamma**3 * \
             beta**2 / (6 * np.pi * sc.epsilon_0 * sc.c) / \
             (sc.m_e * sc.c**2)  # radians per second squared
         logger.debug("Chirp rate: %.3e rad/s^2", chirp_rate_ang)
 
-        # Generate the LO signal for I/Q demodulation and add in the chirp
+        # Generate the LO signal for I/Q demodulation and add in the chirp.
+        # chirp_rate_ang is d(omega)/dt, so the phase of a linear chirp is
+        # 0.5 * d(omega)/dt * t^2.
         lo_signal = np.exp(-2j * np.pi * self.__lo_freq * times_fast_sample)
         rf_signal_dm = np.sum(fourier_amps[:, np.newaxis] * np.exp(2j * np.pi * fourier_freqs[:, np.newaxis]
-                              * times_fast_sample), axis=0) * lo_signal * np.exp(1j * chirp_rate_ang * times_fast_sample**2)
+                              * times_fast_sample), axis=0) * lo_signal * np.exp(0.5j * chirp_rate_ang * times_fast_sample**2)
 
         # Generate a Butterworth filter and filter the signal
         sos = butter(N=8, Wn=self.__sample_rate / 2, btype='low', output='sos',

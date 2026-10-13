@@ -179,6 +179,7 @@ class ScatteringSimulator:
         current_phi_c = phi_c
         current_phi_a = phi_a
         phi_chirp = 0.0
+        omega_chirp = 0.0
         escaped = False
 
         while elapsed < self.__max_event_time:
@@ -231,7 +232,7 @@ class ScatteringSimulator:
             )
             segment = self._generate_segment(
                 spec_calc, orders, n_samples, fast_rate, elapsed,
-                current_phi_c, current_phi_a, phi_chirp)
+                current_phi_c, current_phi_a, phi_chirp, omega_chirp)
             segments.append(segment)
 
             # Compute phase advances for continuity
@@ -240,13 +241,17 @@ class ScatteringSimulator:
 
             beta = current_particle.get_beta()
             gamma = current_particle.get_gamma()
-            chirp_rate = (sc.e**2 * (2 * np.pi * f0)**3 * gamma * beta**2
+            chirp_rate = (sc.e**2 * (2 * np.pi * f0)**3 * gamma**3 * beta**2
                           / (6 * np.pi * sc.epsilon_0 * sc.c)
                           / (sc.m_e * sc.c**2))
 
             current_phi_c += 2 * np.pi * f0 * actual_dt
             current_phi_a += 2 * np.pi * fa * actual_dt
-            phi_chirp += chirp_rate * actual_dt**2
+            # Piecewise-constant chirp rate: carry both the accumulated phase
+            # and the accumulated angular-frequency offset across the segment
+            # boundary, so the radiative frequency drift stays monotonic.
+            phi_chirp += omega_chirp * actual_dt + 0.5 * chirp_rate * actual_dt**2
+            omega_chirp += chirp_rate * actual_dt
             elapsed += actual_dt
 
             if dt_scatter >= self.__max_event_time - (elapsed - actual_dt):
@@ -347,7 +352,8 @@ class ScatteringSimulator:
                           orders: NDArray, n_samples: int,
                           fast_rate: float, elapsed: float,
                           phi_c: float, phi_a: float,
-                          phi_chirp: float) -> NDArray:
+                          phi_chirp: float,
+                          omega_chirp: float = 0.0) -> NDArray:
         """
         Generate an oversampled RF signal segment for a single particle state.
         """
@@ -372,7 +378,7 @@ class ScatteringSimulator:
         beta = particle.get_beta()
         gamma = particle.get_gamma()
         central_freq = spec_calc.get_peak_frequency(0)
-        chirp_rate = (sc.e**2 * (2 * np.pi * central_freq)**3 * gamma
+        chirp_rate = (sc.e**2 * (2 * np.pi * central_freq)**3 * gamma**3
                       * beta**2 / (6 * np.pi * sc.epsilon_0 * sc.c)
                       / (sc.m_e * sc.c**2))
 
@@ -385,8 +391,11 @@ class ScatteringSimulator:
         # LO uses absolute time for continuity across segments
         lo = np.exp(-2j * np.pi * self.__lo_freq * t_abs)
 
-        # Chirp: accumulated phase + local quadratic term
-        chirp = np.exp(1j * (phi_chirp + chirp_rate * t_local**2))
+        # Chirp: accumulated phase, the frequency offset inherited from earlier
+        # segments acting over local time, and this segment's own quadratic
+        # term. The phase of a linear chirp is 0.5 * d(omega)/dt * t^2.
+        chirp = np.exp(1j * (phi_chirp + omega_chirp * t_local
+                             + 0.5 * chirp_rate * t_local**2))
 
         # Scale by sqrt(power_norm) per segment (IMPEDANCE applied after filter)
         power_norm = spec_calc.get_power_norm()

@@ -258,3 +258,28 @@ class TestSignalOutput:
         sim = ScatteringSimulator(trap, wg, gas, SAMPLE_RATE, lo, 1e-6)
         result = sim.simulate(particle, MAX_ORDER, np.random.default_rng(42))
         assert np.any(result.signal != 0)
+
+
+class TestChirpContinuity:
+
+    def test_non_interacting_scatters_match_signal_generator(self):
+        """Scatters that leave the particle unchanged split the event into
+        segments but must not change the signal: the chirp phase and the
+        accumulated frequency drift both have to carry across boundaries."""
+        trap, wg, particle = _make_components()
+        gas = GasModel([(ConstantCrossSection(1e-18), 1e17)])
+        lo = _make_lo_freq(trap, wg, particle)
+        acq_time = 10e-6
+
+        sim = ScatteringSimulator(trap, wg, gas, SAMPLE_RATE, lo, acq_time)
+        scat_result = sim.simulate(particle, MAX_ORDER,
+                                   np.random.default_rng(42))
+        assert len(scat_result.scatter_times) > 0
+
+        spec = SpectrumCalculator(trap, wg, particle)
+        _, sig_ref = SignalGenerator(spec, SAMPLE_RATE, lo,
+                                     acq_time).generate_signal(MAX_ORDER)
+
+        assert len(scat_result.signal) == len(sig_ref)
+        err = np.linalg.norm(scat_result.signal - sig_ref) / np.linalg.norm(sig_ref)
+        assert err < 1e-6

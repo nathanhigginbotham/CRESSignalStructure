@@ -208,3 +208,28 @@ class TestNinetyDegreeMainbandAnalytical:
         spec_90 = SpectrumCalculator(trap, wg, particle_90)
         for n in (-2, -1, 1, 2):
             assert np.isclose(np.abs(spec_90.get_peak_amp(n)), 0.0, atol=1e-12)
+
+
+class TestChirpRate:
+    """The realised frequency slope must equal the radiative-loss rate."""
+
+    def test_realised_slope_matches_radiative_loss(self):
+        """Fit the unwrapped carrier phase and compare its slope to
+        d(omega)/dt = (omega / gamma) * P / (m c^2), with P the relativistic
+        Larmor power at the actual cyclotron frequency."""
+        spec, _, particle = _make_harmonic_spec(pitch=np.deg2rad(89.9))
+        f0 = spec.get_peak_frequency(0)
+        sg = SignalGenerator(spec, 1e9, f0 - 250e6, 200e-6)
+        t, sig = sg.generate_signal(0)
+
+        # Drop the zero-phase filter's edge transients before fitting
+        keep = slice(len(t) // 20, -len(t) // 20)
+        coeffs = np.polyfit(t[keep], np.unwrap(np.angle(sig[keep])), 2)
+        realised = 2 * coeffs[0]    # d(omega)/dt of the fitted phase
+
+        omega = 2 * np.pi * f0
+        gamma, beta = particle.get_gamma(), particle.get_beta()
+        power = sc.e**2 * omega**2 * beta**2 * gamma**4 / \
+            (6 * np.pi * sc.epsilon_0 * sc.c)
+        expected = omega / gamma * power / (sc.m_e * sc.c**2)
+        assert realised == pytest.approx(expected, rel=5e-3)
