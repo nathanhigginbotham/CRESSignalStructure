@@ -50,11 +50,17 @@ def _git_commit() -> str:
 
 
 def make_particle_generator(ranges, particle_seed, file_idx):
-    """Particle i of a file drawn from its own (seed, file, i) stream."""
+    """Particle i of a file drawn from its own (seed, file, i) stream.
+
+    The draw order (energy, pitch, z, radius, azimuth) is that of the
+    io-pipeline BatchGen.py that produced random_phase_v1, so the same seeds
+    give the same particles and the two datasets can be compared event by
+    event."""
     def gen(i):
         rng = np.random.default_rng([particle_seed, file_idx, i])
         ke = rng.uniform(*ranges['energy'])
         pitch = rng.uniform(*ranges['pitch'])
+        rng.uniform(0.0, 0.0)       # z draw (always 0); keeps the stream aligned
         r_min, r_max = ranges['r']
         r = np.sqrt((r_max**2 - r_min**2) * rng.uniform(0, 1) + r_min**2)
         theta = rng.uniform(0.0, 2 * np.pi)
