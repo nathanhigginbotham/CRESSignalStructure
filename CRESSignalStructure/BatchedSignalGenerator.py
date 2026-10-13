@@ -318,15 +318,15 @@ class BatchedSynthesiser:
     filter_chunk : int
         Chunk length of the device IIR; must be a multiple of the
         oversampling factor so the decimated rows repeat in every chunk
-    max_elements : int
+    max_elements : int, optional
         Upper bound on (events x tones x samples) per synthesis chunk, which
-        bounds device memory
+        bounds device memory (default 2**22 on CPU, 2**25 otherwise)
     """
 
     def __init__(self, sample_rate: float, lo_freq: float, acq_time: float,
                  device: str = "cpu", phasor: str = "direct", block_len: int = 1000,
                  filter_backend: Optional[str] = None, filter_chunk: int = 500,
-                 max_elements: int = 2 ** 22):
+                 max_elements: Optional[int] = None):
         torch = _import_torch()
         self.torch = torch
         self.device = torch.device(device)
@@ -347,6 +347,8 @@ class BatchedSynthesiser:
         self.phasor = phasor
         self.block_len = int(block_len)
         self.filter_backend = filter_backend
+        if max_elements is None:
+            max_elements = 2 ** 22 if self.device.type == "cpu" else 2 ** 25
         self.max_elements = int(max_elements)
 
         # Same expressions as SignalGenerator.generate_signal
