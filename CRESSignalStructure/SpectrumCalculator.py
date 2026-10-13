@@ -22,7 +22,6 @@ import numpy as np
 import scipy.constants as sc
 from scipy.special import jv, jvp, j1
 from scipy.integrate import quad, simpson
-from scipy.interpolate import interp1d
 from numpy.typing import ArrayLike, NDArray
 
 logger = logging.getLogger(__name__)
@@ -375,8 +374,7 @@ class SpectrumCalculator:
 
     def _peak_amp_integral(self, order_1d: NDArray) -> NDArray:
         """Evaluate the positive-frequency numerical amplitude integral for each order."""
-        t1, z = self._trap.calc_t_vs_z(self._particle)
-        interp_t1_z = interp1d(t1, z, kind='cubic')
+        interp_t1_z = self._trap.t_to_z_interpolator(self._particle)
 
         N_T_POINTS = 499
         omega_a = self._trap.calc_omega_axial(self._particle)

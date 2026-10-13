@@ -168,6 +168,42 @@ class BaseField(ABC):
                 self.evaluate_field_magnitude(rho - eps, 0, z)) / (2 * eps)
         return grad
 
+    def _field_magnitude_and_bz(self, rho: NDArray, z: NDArray) -> tuple[NDArray, NDArray]:
+        """
+        Field magnitude and B_z at (rho, 0, z) from a single evaluate_field call
+
+        The magnitude is formed exactly as evaluate_field_magnitude forms it,
+        so the result is bitwise identical to calling both methods. A subclass
+        that overrides evaluate_field_magnitude keeps its own implementation.
+        """
+        if type(self).evaluate_field_magnitude is not BaseField.evaluate_field_magnitude:
+            _, _, b_z = self.evaluate_field(rho, 0.0, z)
+            return self.evaluate_field_magnitude(rho, 0.0, z), b_z
+        b_x, b_y, b_z = self.evaluate_field(rho, 0.0, z)
+        return np.sqrt(b_x**2 + b_y**2 + b_z**2), b_z
+
+    def t_to_z_interpolator(self, particle: Particle) -> interp1d:
+        """
+        Cubic interpolator z(t) over one axial period, built from calc_t_vs_z
+
+        Memoised inside a memoised() context, so the spline is built once per
+        particle. The returned object must not be modified.
+
+        Parameters
+        ----------
+        particle : Particle
+            The particle being trapped
+
+        Returns
+        -------
+        interp1d
+            Cubic interpolator from time in seconds to z in metres
+        """
+        def build():
+            t, z = self.calc_t_vs_z(particle)
+            return interp1d(t, z, kind='cubic')
+        return self._memo_call('t_to_z_interp', particle, (), build)
+
     def calc_rho_along_field_line(self, rho_0: float,
                                   z: ArrayLike) -> NDArray:
         """
@@ -278,7 +314,7 @@ class BaseField(ABC):
         # Initially calculate the axial period
         t, z = self.calc_t_vs_z(particle)
         t_vals = np.linspace(0.0, t[-1], n_t_points, endpoint=True)
-        t_to_z = interp1d(t, z, kind='cubic')
+        t_to_z = self.t_to_z_interpolator(particle)
         z = t_to_z(t_vals)
         pStart = particle.get_position()
         rho_0 = np.sqrt(pStart[0]**2 + pStart[1]**2)
@@ -356,8 +392,7 @@ class BaseField(ABC):
         dz_du = 2 * zMax * np.sin(u_points) * np.cos(u_points)
 
         rho = self.calc_rho_along_field_line(rho_0, z)
-        B_mag = self.evaluate_field_magnitude(rho, 0.0, z)
-        _, _, B_z = self.evaluate_field(rho, 0.0, z)
+        B_mag, B_z = self._field_magnitude_and_bz(rho, z)
 
         # dt/dz = γm |B| / (p_∥ |B_z|), where p_∥ = sqrt(p0² - 2γm μ B)
         p_parallel = np.sqrt(np.maximum(
@@ -421,8 +456,7 @@ class BaseField(ABC):
         dz_du = 2 * zMax * np.sin(u_points) * np.cos(u_points)
 
         rho = self.calc_rho_along_field_line(rho_0, z1)
-        B_mag = self.evaluate_field_magnitude(rho, 0.0, z1)
-        _, _, B_z_comp = self.evaluate_field(rho, 0.0, z1)
+        B_mag, B_z_comp = self._field_magnitude_and_bz(rho, z1)
         p_parallel = np.sqrt(np.maximum(
             p0**2 - 2 * gamma * particle.get_mass() * muMag * B_mag, 0.0))
 
