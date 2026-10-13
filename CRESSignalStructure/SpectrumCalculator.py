@@ -8,11 +8,13 @@ accordingly. The analytical path uses closed-form Bessel-function expressions;
 the numerical path integrates the cyclotron phase over the axial period.
 """
 
+import functools
 import logging
+from contextlib import nullcontext
 from typing import overload
 
 from .BaseTrap import BaseTrap
-from .BaseField import BaseField
+from .BaseField import BaseField, _particle_state_key
 from .CircularWaveguide import CircularWaveguide
 from .QTNMTraps import HarmonicTrap, BathtubTrap
 from .Particle import Particle
@@ -24,6 +26,23 @@ from scipy.interpolate import interp1d
 from numpy.typing import ArrayLike, NDArray
 
 logger = logging.getLogger(__name__)
+
+
+def _with_field_memo(method):
+    """
+    Run a SpectrumCalculator method with the field's memoisation enabled.
+
+    The per-instance store means quantities such as the axial frequency, the
+    turning point and the t(z) relation are computed once per particle and
+    reused across get_peak_frequency, get_peak_amp and get_power_norm calls.
+    Cached values come from exactly the same operations, so results are
+    bitwise identical to the uncached path.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._field_memo_scope():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class SpectrumCalculator:
@@ -42,6 +61,8 @@ class SpectrumCalculator:
         self._trap = trap
         self._waveguide = waveguide
         self._particle = particle
+        # Per-instance cache of particle-dependent results; see _with_field_memo
+        self._memo: dict = {}
         logger.info(
             "Created SpectrumCalculator: trap=%s, waveguide_radius=%.3e m, "
             "particle_energy=%.1f eV, pitch_angle=%.4f rad",
@@ -52,6 +73,29 @@ class SpectrumCalculator:
     def get_particle(self) -> Particle:
         return self._particle
 
+    def _field_memo_scope(self):
+        """Context in which the numerical field caches into this instance's store."""
+        if isinstance(self._trap, BaseField):
+            return self._trap.memoised(self.__dict__.setdefault('_memo', {}))
+        return nullcontext()
+
+    def _memo_get(self, key_fn, compute):
+        """
+        Return compute() cached under key_fn() in this instance's store. If the
+        key cannot be formed (e.g. mocked objects) the value is not cached.
+        """
+        store = self.__dict__.setdefault('_memo', {})
+        try:
+            key = key_fn()
+            hash(key)
+        except Exception:
+            return compute()
+        if key not in store:
+            store[key] = compute()
+        value = store[key]
+        return value.copy() if isinstance(value, np.ndarray) else value
+
+    @_with_field_memo
     def get_power_norm(self) -> float:
         """
         Calculate the power normalisation for an electron in a circular
@@ -66,7 +110,10 @@ class SpectrumCalculator:
             return rho * ((j1(kc * rho) / (kc * rho))**2 + jvp(1, kc * rho)**2)
 
         kc = self._waveguide.get_kc()
-        alpha, _ = quad(alphaIntegrand, 0, self._waveguide.get_radius(), args=kc)
+        # alpha depends only on the waveguide, so it is evaluated once per instance
+        alpha = self._memo_get(
+            lambda: ('power_norm_alpha', float(kc), float(self._waveguide.get_radius())),
+            lambda: quad(alphaIntegrand, 0, self._waveguide.get_radius(), args=kc)[0])
         r_gyro = np.sqrt(self._particle.get_position()[0]**2 +
                          self._particle.get_position()[1]**2)
 
@@ -141,6 +188,7 @@ class SpectrumCalculator:
     @overload
     def get_peak_frequency(self, order: NDArray, negativeFreqs: bool = False) -> NDArray: ...
 
+    @_with_field_memo
     def get_peak_frequency(self, order, negativeFreqs=False):
         """
         Calculate the frequencies at which spectral components occur
@@ -177,6 +225,7 @@ class SpectrumCalculator:
         else:
             return f0 + order * fa
 
+    @_with_field_memo
     def get_peak_amp(self, order: ArrayLike, negativeFreqs=False) -> NDArray:
         """
         Calculate the complex amplitude of spectral peaks
@@ -310,6 +359,22 @@ class SpectrumCalculator:
             np.atleast_1d(order).size
         )
 
+        order_1d = np.atleast_1d(order)
+        # The negative-frequency amplitudes are exactly the conjugates of the
+        # positive ones, so the integral is evaluated once per order set
+        amp = self._memo_get(
+            lambda: ('peak_amp_numerical', self._trap._memo_fingerprint(),
+                     _particle_state_key(self._particle),
+                     float(self._waveguide.get_kc()), tuple(order_1d.tolist())),
+            lambda: self._peak_amp_integral(order_1d))
+        if negativeFreqs:
+            amp = np.conjugate(amp)
+        if np.ndim(order) == 0:
+            return amp[0]
+        return amp
+
+    def _peak_amp_integral(self, order_1d: NDArray) -> NDArray:
+        """Evaluate the positive-frequency numerical amplitude integral for each order."""
         t1, z = self._trap.calc_t_vs_z(self._particle)
         interp_t1_z = interp1d(t1, z, kind='cubic')
 
@@ -324,15 +389,9 @@ class SpectrumCalculator:
         v_phase = sc.c / np.sqrt(1 - (omega_c / omega_0)**2)
         kLambda = omega_0 / v_phase
 
-        order_1d = np.atleast_1d(order)
         order_reshaped = order_1d.reshape(-1, 1)
         common_phase = np.exp(1j * (phi_t + kLambda * z_t - omega_0 * t))
         order_phase = np.exp(-1j * order_reshaped * omega_a * t)
         integrand = common_phase * order_phase
 
-        amp = simpson(integrand, t, axis=1) / Ta
-        if negativeFreqs:
-            amp = np.conjugate(amp)
-        if np.ndim(order) == 0:
-            return amp[0]
-        return amp
+        return simpson(integrand, t, axis=1) / Ta
