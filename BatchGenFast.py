@@ -117,8 +117,16 @@ def main():
               'pitch': (np.radians(args.pitch_min), np.radians(args.pitch_max)),
               'r': (0.0, args.r_max)}
 
+    # Every physical constant goes in the run config so a dataset can be
+    # checked against its intended geometry without reading the code.
     config = {**vars(args), 'lo_freq': lo_freq, 'generator': 'BatchGenFast.py',
-              'css_commit': _git_commit()}
+              'css_commit': _git_commit(),
+              'physics': {'trap_depth_T': trap_depth, 'background_field_T': b0,
+                          'coil_radius_m': r_coil,
+                          'coil_current_A': 2 * trap_depth * r_coil / sc.mu_0,
+                          'waveguide_radius_m': 5e-3, 'sample_rate_Hz': f_digitiser,
+                          'chirp': 'physical (0.5 k t^2, gamma^3)',
+                          'time_axis': 'arange / fs'}}
     cfg_path = os.path.join(args.outdir, f"run_config_{args.prefix}_{args.first_file:03d}.json")
     with open(cfg_path, "w") as f:
         json.dump(config, f, indent=2)
