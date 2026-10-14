@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:v100:1
-#SBATCH --mem=32GB
+#SBATCH --mem=12GB
 #SBATCH --time=04:00:00
 #SBATCH --output=hypatia/%j_genfast.out
 #SBATCH --error=hypatia/%j_genfast.err
