@@ -362,7 +362,8 @@ class SparseSpectrumWriter:
                                self.n_offered)
                 continue
             lab = event_labels(attrs, n, self.fs)
-            row = {'key': f"signal{self.n_offered}", 'draw_index': int(draw_indices[j]),
+            row = {'source_file': Path(self.source_file).name,
+                   'key': f"signal{self.n_offered}", 'draw_index': int(draw_indices[j]),
                    'gen_chirp_rate_rad_s2': float(chirp_rates[j]),
                    'gen_power_norm_w': float(power_norms[j])}
             for name, value in (getattr(p, 'draw_values', None) or {}).items():
