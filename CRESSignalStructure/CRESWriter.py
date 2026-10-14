@@ -92,48 +92,22 @@ class CRESWriter:
         except Exception:
             return float('nan'), float('nan')
 
-    def write_event(self, particle: Particle,
-                    time_array: np.ndarray,
-                    signal_array: np.ndarray,
-                    phi_c: float = None,
-                    phi_a: float = None,
-                    f_cyc_mean: float = None,
-                    f_axial: float = None):
+    def event_attributes(self, particle: Particle,
+                         phi_c: float = None,
+                         phi_a: float = None,
+                         f_cyc_mean: float = None,
+                         f_axial: float = None) -> dict:
         """
-        Writes a single event with the exact legacy attribute structure.
+        Truth attributes of one event, keyed and ordered exactly as
+        write_event stores them.
 
-        Also writes the orbit-averaged ('Mean') cyclotron frequency and the
-        axial frequency, which are the observable truth labels. Callers that
-        already hold them (the batched generator computes them alongside the
-        tone parameters) pass f_cyc_mean and f_axial to avoid recomputing the
-        orbit integrals; otherwise they are computed here. phi_c / phi_a, if
-        given, are stored as the initial cyclotron and axial phases.
+        Needs only set_global_config (no open file), so other writers (the
+        sparse spectrum writer) can store attributes that are bitwise those
+        of the dense HDF5 files. Arguments as for write_event.
         """
-        if self.file is None or self._config is None or self._trap is None:
-            raise RuntimeError("CRESWriter must be used within a 'with' statement and set_global_config must be called first.")
+        if getattr(self, '_config', None) is None or getattr(self, '_trap', None) is None:
+            raise RuntimeError("set_global_config must be called first.")
 
-        # --- SAFETY CHECK ---
-        if len(time_array) != len(signal_array):
-            raise ValueError(
-                f"Shape Mismatch: Time array ({len(time_array)}) "
-                f"does not match Signal array ({len(signal_array)})"
-            )
-        # ----------------------------------------------
-
-        sig_name = f"signal{self.current_index + 1}"
-        grp = self.file['Data']
-        
-        # 1. Write Data (Complex64)
-        if np.iscomplexobj(signal_array):
-            data_to_write = signal_array.astype('complex64')
-        else:
-            # Fallback for FFT power (real float)
-            data_to_write = signal_array.astype('float32')
-            
-        dset = grp.create_dataset(sig_name, data=data_to_write)
-
-        # 2. Calculate Derived Physics Values
-        
         # --- Kinematics ---
         gamma = particle.get_gamma()
         mass = particle.get_mass()
@@ -166,8 +140,8 @@ class CRESWriter:
         else:
             impedance = np.nan
 
-        # 3. Set Attributes (Exact Legacy Keys)
-        attrs = dset.attrs
+        # Exact legacy keys, in the order they are written to HDF5
+        attrs = {}
         
         # Trap / Background
         if isinstance(self._trap, (HarmonicField, BathtubField)):
@@ -212,6 +186,54 @@ class CRESWriter:
             attrs['r_wg [metres]'] = self._waveguide.get_radius()
         else:
             attrs['r_wg [metres]'] = 0.005 # Default 5mm
+        return attrs
+
+    def write_event(self, particle: Particle,
+                    time_array: np.ndarray,
+                    signal_array: np.ndarray,
+                    phi_c: float = None,
+                    phi_a: float = None,
+                    f_cyc_mean: float = None,
+                    f_axial: float = None):
+        """
+        Writes a single event with the exact legacy attribute structure.
+
+        Also writes the orbit-averaged ('Mean') cyclotron frequency and the
+        axial frequency, which are the observable truth labels. Callers that
+        already hold them (the batched generator computes them alongside the
+        tone parameters) pass f_cyc_mean and f_axial to avoid recomputing the
+        orbit integrals; otherwise they are computed here. phi_c / phi_a, if
+        given, are stored as the initial cyclotron and axial phases.
+        """
+        if self.file is None or self._config is None or self._trap is None:
+            raise RuntimeError("CRESWriter must be used within a 'with' statement and set_global_config must be called first.")
+
+        # --- SAFETY CHECK ---
+        if len(time_array) != len(signal_array):
+            raise ValueError(
+                f"Shape Mismatch: Time array ({len(time_array)}) "
+                f"does not match Signal array ({len(signal_array)})"
+            )
+        # ----------------------------------------------
+
+        sig_name = f"signal{self.current_index + 1}"
+        grp = self.file['Data']
+        
+        # 1. Write Data (Complex64)
+        if np.iscomplexobj(signal_array):
+            data_to_write = signal_array.astype('complex64')
+        else:
+            # Fallback for FFT power (real float)
+            data_to_write = signal_array.astype('float32')
+            
+        dset = grp.create_dataset(sig_name, data=data_to_write)
+
+        # 2. Derived physics values, set as attributes in the legacy order
+        # (same HDF5 calls in the same order, so files are byte-identical
+        # to those written before event_attributes was split out)
+        for key, value in self.event_attributes(particle, phi_c, phi_a,
+                                                f_cyc_mean, f_axial).items():
+            dset.attrs[key] = value
 
         self.current_index += 1
         logger.debug(
