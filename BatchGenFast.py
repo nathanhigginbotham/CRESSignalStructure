@@ -16,6 +16,17 @@ every file), and files can be split across jobs with --first-file.
 Each file is written to <name>.partial and renamed when complete, so an
 interrupted run resumes by skipping finished files.
 
+Sparse output (--sparse): instead of the dense records, write each file
+index as a directory <prefix>_<fff>_sparse holding the noiseless spectrum
+X / fft_sigma(N, T_ref) of every event, keeping only the bins whose
+amplitude at --sparse-tmin exceeds --sparse-rel of the per-component noise
+std (about 45 kB per 40 us event instead of 320 kB), plus labels, SNRs and
+the full truth table. The layout is that of the detection repository's
+full-band cache (CRESSignalStructure/SparseSpectrum.py), so a directory is
+read there directly. Event i of the sparse unit f is the same electron as
+event i of dense file f (same seeds, draws and drop logic); --also-dense
+writes both for validation (scripts/check_sparse_generation.py).
+
 Usage example (the random_phase_v1 test layout):
     python BatchGenFast.py --files 10 --events 10000 --prefix test_100K \
         --pitch-min 86.5 --pitch-max 90 --energy-min 18500 --energy-max 18600 \
@@ -37,6 +48,7 @@ from CRESSignalStructure.CircularWaveguide import CircularWaveguide
 from CRESSignalStructure.Particle import Particle
 from CRESSignalStructure.SpectrumCalculator import SpectrumCalculator
 from CRESSignalStructure.BatchedSignalGenerator import generate_ensemble_batched
+from CRESSignalStructure.SparseSpectrum import SparseSpectrumWriter
 
 
 def _git_commit() -> str:
@@ -64,8 +76,13 @@ def make_particle_generator(ranges, particle_seed, file_idx):
         r_min, r_max = ranges['r']
         r = np.sqrt((r_max**2 - r_min**2) * rng.uniform(0, 1) + r_min**2)
         theta = rng.uniform(0.0, 2 * np.pi)
-        return Particle(ke=ke, startPos=np.array([r * np.cos(theta), r * np.sin(theta), 0.0]),
-                        pitchAngle=pitch)
+        p = Particle(ke=ke, startPos=np.array([r * np.cos(theta), r * np.sin(theta), 0.0]),
+                     pitchAngle=pitch)
+        # The raw draws, for the sparse truth table (r and theta are not
+        # recoverable bitwise from the start position)
+        p.draw_values = {'energy_ev': ke, 'pitch_rad': pitch, 'z_m': 0.0,
+                         'radius_m': r, 'azimuth_rad': theta}
+        return p
     return gen
 
 
@@ -77,7 +94,7 @@ def make_phase_generator(phase_seed, file_idx):
     return gen
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description="Generate CRES batches with the batched generator")
     p.add_argument("--files", type=int, default=1, help="Number of files")
     p.add_argument("--first-file", type=int, default=0,
@@ -98,7 +115,19 @@ def main():
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--workers", type=int, default=1, help="Processes for the physics stage")
     p.add_argument("--fft", action="store_true", help="Also write FFT power files")
-    args = p.parse_args()
+    p.add_argument("--sparse", action="store_true",
+                   help="Write sparse noiseless spectra (full-band cache layout) instead of dense records")
+    p.add_argument("--also-dense", action="store_true",
+                   help="With --sparse, also write the dense records (validation)")
+    p.add_argument("--sparse-tmin", type=float, default=2.0,
+                   help="Coldest training temperature (K) the threshold refers to")
+    p.add_argument("--sparse-rel", type=float, default=1e-2,
+                   help="Keep bins above this fraction of the per-component noise std at --sparse-tmin")
+    p.add_argument("--sparse-tref", type=float, default=10.0,
+                   help="Reference temperature (K) of the stored normalised spectrum")
+    args = p.parse_args(argv)
+    if args.also_dense and not args.sparse:
+        p.error("--also-dense needs --sparse")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     os.makedirs(args.outdir, exist_ok=True)
@@ -136,22 +165,40 @@ def main():
     total, dropped = 0, 0
     for fi in range(args.first_file, args.first_file + args.files):
         final = os.path.join(args.outdir, f"{args.prefix}_{fi:03d}_signal.h5")
-        if os.path.exists(final):
+        sparse_final = os.path.join(args.outdir, f"{args.prefix}_{fi:03d}_sparse")
+        # A unit is done when every requested output exists; only the
+        # missing ones are regenerated (same seeds, so they still match)
+        want_dense = not args.sparse or args.also_dense
+        need_dense = want_dense and not os.path.exists(final)
+        need_sparse = args.sparse and not os.path.exists(sparse_final)
+        if not (need_dense or need_sparse):
             print(f"[file {fi}] exists, skipping")
             continue
         partial = final + ".partial"
-        fft_final = os.path.join(args.outdir, f"{args.prefix}_{fi:03d}_fft.h5") if args.fft else None
+        fft_final = (os.path.join(args.outdir, f"{args.prefix}_{fi:03d}_fft.h5")
+                     if args.fft and need_dense else None)
+        sparse_writer = None
+        if need_sparse:
+            sparse_writer = SparseSpectrumWriter(
+                sparse_final + ".partial", source_file=os.path.abspath(final),
+                device=args.device, system_temp_ref=args.sparse_tref,
+                temp_min=args.sparse_tmin, rel_threshold=args.sparse_rel,
+                provenance={**config, 'file_index': fi})
         t0 = time.time()
         n_drop = generate_ensemble_batched(
-            output_file=partial, n_events=args.events,
+            output_file=partial if need_dense else None, n_events=args.events,
             particle_generator=make_particle_generator(ranges, args.particle_seed, fi),
             phase_generator=make_phase_generator(args.phase_seed, fi),
             trap=trap, waveguide=wg, sim_config=sim_config,
             fft_output_file=(fft_final + ".partial") if fft_final else None,
-            device=args.device, batch_size=args.batch_size, n_workers=args.workers)
-        os.replace(partial, final)
+            device=args.device, batch_size=args.batch_size, n_workers=args.workers,
+            sparse_writer=sparse_writer)
+        if need_dense:
+            os.replace(partial, final)
         if fft_final:
             os.replace(fft_final + ".partial", fft_final)
+        if need_sparse:
+            os.replace(sparse_final + ".partial", sparse_final)
         dt = time.time() - t0
         total += args.events - n_drop
         dropped += n_drop
