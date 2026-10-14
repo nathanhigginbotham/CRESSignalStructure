@@ -643,7 +643,7 @@ def _fft_power(signal: NDArray, sample_rate: float) -> tuple[NDArray, NDArray]:
     return freqs, np.abs(fft_complex)**2
 
 
-def generate_ensemble_batched(output_file: str,
+def generate_ensemble_batched(output_file: Optional[str],
                               n_events: int,
                               particle_generator: Callable[[int], Particle],
                               trap: BaseTrap | BaseField,
@@ -655,6 +655,7 @@ def generate_ensemble_batched(output_file: str,
                               batch_size: int = 64,
                               n_workers: int = 1,
                               verbose: bool = True,
+                              sparse_writer=None,
                               **synth_kwargs) -> int:
     """
     Batched counterpart of EnsembleGenerator.generate_ensemble
@@ -680,6 +681,11 @@ def generate_ensemble_batched(output_file: str,
         Events per synthesis batch (also the write granularity)
     n_workers : int
         Processes for the CPU physics stage (kept alive across batches)
+    sparse_writer : SparseSpectrum.SparseSpectrumWriter, optional
+        Also (or, with output_file=None, only) write the sparse noiseless
+        spectra. It receives exactly the float64 records the dense writer
+        casts to complex64, for the same events in the same order, and
+        numbers them with the dense dataset names.
     **synth_kwargs
         Passed to BatchedSynthesiser
     """
@@ -688,8 +694,13 @@ def generate_ensemble_batched(output_file: str,
     sample_rate = sim_config.get('sample_rate', 1e9)
     start = time.time()
     with ExitStack() as stack:
-        writer = stack.enter_context(CRESWriter(output_file))
-        writer.set_global_config(trap, waveguide, sim_config)
+        writer = None
+        if output_file:
+            writer = stack.enter_context(CRESWriter(output_file))
+            writer.set_global_config(trap, waveguide, sim_config)
+        if sparse_writer is not None:
+            stack.enter_context(sparse_writer)
+            sparse_writer.set_global_config(trap, waveguide, sim_config)
         fft_writer = None
         if fft_output_file:
             fft_writer = stack.enter_context(CRESWriter(fft_output_file))
@@ -733,22 +744,35 @@ def generate_ensemble_batched(output_file: str,
             signals = synth.synthesise(tones)
             pcw = [None] * len(ok) if pc is None else [float(pcb[j]) for j in ok]
             paw = [None] * len(ok) if pa is None else [float(pab[j]) for j in ok]
+            written = []
             for j, (p, sig) in enumerate(zip(particles, signals)):
                 if not np.all(np.isfinite(sig)):
                     n_failed += 1
                     logger.warning("Dropped event with non-finite signal in batch starting at %d", b0)
                     continue
-                writer.write_event(p, synth.times, sig, phi_c=pcw[j], phi_a=paw[j],
-                                   f_cyc_mean=float(tones.mean_freqs[j]),
-                                   f_axial=float(tones.axial_freqs[j]))
+                if writer:
+                    writer.write_event(p, synth.times, sig, phi_c=pcw[j], phi_a=paw[j],
+                                       f_cyc_mean=float(tones.mean_freqs[j]),
+                                       f_axial=float(tones.axial_freqs[j]))
                 if fft_writer:
                     freqs, power = _fft_power(sig, sample_rate)
                     fft_writer.write_event(p, freqs, power)
+                written.append(j)
+            if sparse_writer is not None and written:
+                sparse_writer.write_events(
+                    signals[written], [particles[j] for j in written],
+                    draw_indices=[b0 + ok[j] for j in written],
+                    phi_c=[pcw[j] for j in written], phi_a=[paw[j] for j in written],
+                    f_cyc_mean=[float(tones.mean_freqs[j]) for j in written],
+                    f_axial=[float(tones.axial_freqs[j]) for j in written],
+                    chirp_rates=[float(tones.chirp_rates[j]) for j in written],
+                    power_norms=[float(tones.power_norms[j]) for j in written])
             done += len(particles)
             if verbose:
                 rate = done / (time.time() - start)
                 logger.info("  Processed %d/%d events (%.1f ev/s)...", done, n_events, rate)
-    logger.info("Done! Saved to %s (%d event(s) dropped)", output_file, n_failed)
+    logger.info("Done! Saved to %s (%d event(s) dropped)",
+                output_file or getattr(sparse_writer, 'out_dir', None), n_failed)
     return n_failed
 
 
