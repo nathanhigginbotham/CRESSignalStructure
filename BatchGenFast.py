@@ -27,6 +27,22 @@ read there directly. Event i of the sparse unit f is the same electron as
 event i of dense file f (same seeds, draws and drop logic); --also-dense
 writes both for validation (scripts/check_sparse_generation.py).
 
+Trap depth (--trap-depth, tesla, default 4 mT): the HarmonicField coil
+current is set so that the coil field at the trap centre equals the depth,
+which therefore sets the field map, the LO and the trapping threshold. On
+axis an electron is trapped when sin^2(pitch) > (B0 - depth) / B0 (86.37 deg
+at 4 mT, 79.70 deg at 32 mT; off axis the threshold is lower). A pitch range
+reaching below the on-axis threshold is refused before anything is
+generated, as is an LO that would put the carrier itself outside the
+digitiser band; within a valid range, the only events dropped are the few
+whose physics fails numerically (pitch within ~2e-3 deg of 90).
+
+LO (--lo-mode): 'quarter' (default, unchanged) puts the reference electron
+(mid energy, mid pitch, on axis) at +fs/4; 'centre' centres the carrier
+range of the sampled box in the band, needed when that range is wider than
+fs/2 (32 mT, pitch 80-90: 828 MHz); --lo-freq sets it explicitly. Downmixed
+frequency labels are signed (f - LO), so a carrier below the LO is negative.
+
 Usage example (the random_phase_v1 test layout):
     python BatchGenFast.py --files 10 --events 10000 --prefix test_100K \
         --pitch-min 86.5 --pitch-max 90 --energy-min 18500 --energy-max 18600 \
@@ -59,6 +75,113 @@ def _git_commit() -> str:
                                        text=True).strip()
     except Exception:
         return "unknown"
+
+
+# Fixed geometry of BatchGen.py; only the trap depth is a run option
+DEFAULT_TRAP_DEPTH_T = 4e-3
+BACKGROUND_FIELD_T = 1.0
+COIL_RADIUS_M = 1.25e-2
+WAVEGUIDE_RADIUS_M = 5e-3
+SAMPLE_RATE_HZ = 1e9
+# Pitch at which the frequency plan evaluates the top of the range: the
+# physics fails numerically within ~2e-3 deg of 90 (those events are dropped)
+PLAN_PITCH_MAX_DEG = 89.99
+
+
+def coil_current(trap_depth: float, r_coil: float = COIL_RADIUS_M) -> float:
+    """Coil current (A) whose central field mu0 I / (2 R) equals the trap depth."""
+    return 2 * trap_depth * r_coil / sc.mu_0
+
+
+def build_trap(trap_depth: float, field_cls=HarmonicField):
+    """HarmonicField of the BatchGen.py geometry with the given depth (T).
+
+    field_cls lets the equivalence benchmark build the same trap from a
+    reference copy of the package."""
+    if not 0.0 < trap_depth < BACKGROUND_FIELD_T:
+        raise ValueError(f"trap depth must be in (0, {BACKGROUND_FIELD_T}) T, got {trap_depth}")
+    return field_cls(radius=COIL_RADIUS_M, current=coil_current(trap_depth),
+                     background=BACKGROUND_FIELD_T)
+
+
+def min_trapped_pitch_deg(trap_depth: float, b0: float = BACKGROUND_FIELD_T) -> float:
+    """On-axis trapping threshold (deg): sin^2(theta) = B_min / B_max = (B0 - d) / B0.
+
+    The coil field opposes the background, so |B| dips by the depth at the
+    centre and recovers B0 far from the coil. Off axis the dip is deeper and
+    the threshold lower, so the on-axis value bounds every start radius."""
+    return float(np.degrees(np.arcsin(np.sqrt((b0 - trap_depth) / b0))))
+
+
+def _tones(trap, wg, ke, pitch_deg, r):
+    """(mean carrier, axial frequency) in Hz of one electron, as the generator computes them."""
+    p = Particle(ke=ke, startPos=np.array([r, 0.0, 0.0]), pitchAngle=np.radians(pitch_deg))
+    f = SpectrumCalculator(trap, wg, p).get_peak_frequency(np.array([0, 1]))
+    return float(f[0]), float(f[1] - f[0])
+
+
+def frequency_plan(trap, wg, trap_depth, ranges_deg):
+    """Check the sampled box is trapped and return its carrier and f_a extremes.
+
+    ranges_deg: {'energy': (eV, eV), 'pitch': (deg, deg), 'r': (m, m)}. The
+    carrier falls with pitch, radius and energy, and f_a rises with pitch
+    and radius, so the extremes are at the corners of the box. Raises
+    ValueError if the pitch range reaches untrapped values or the physics
+    fails at a corner, so a bad range stops the run before any event is
+    generated rather than dropping events one by one."""
+    (e_lo, e_hi), (p_lo, p_hi), (r_lo, r_hi) = (ranges_deg[k] for k in ('energy', 'pitch', 'r'))
+    p_min_trap = min_trapped_pitch_deg(trap_depth)
+    if p_lo <= p_min_trap:
+        raise ValueError(
+            f"pitch range starts at {p_lo} deg but a {trap_depth * 1e3:g} mT trap only "
+            f"traps pitches above {p_min_trap:.4f} deg on axis; raise --pitch-min or "
+            f"--trap-depth (depth needed: {BACKGROUND_FIELD_T * np.cos(np.radians(p_lo))**2:.4g} T)")
+    corners = {}
+    for ke in (e_lo, e_hi):
+        for pitch in (p_lo, min(p_hi, PLAN_PITCH_MAX_DEG)):
+            for r in (r_lo, r_hi):
+                try:
+                    corners[(ke, pitch, r)] = _tones(trap, wg, ke, pitch, r)
+                except Exception as exc:
+                    raise ValueError(f"physics fails at energy {ke} eV, pitch {pitch} deg, "
+                                     f"radius {r} m ({exc!r})") from exc
+    fc = [v[0] for v in corners.values()]
+    fa = [v[1] for v in corners.values()]
+    return {'min_trapped_pitch_deg': p_min_trap,
+            'carrier_Hz': (min(fc), max(fc)), 'axial_Hz': (min(fa), max(fa))}
+
+
+def choose_lo(trap, wg, ranges_deg, plan, sample_rate, mode, lo_freq=None):
+    """LO frequency (Hz): explicit, 'quarter' (reference electron at +fs/4,
+    the BatchGen.py convention) or 'centre' (carrier range centred)."""
+    if lo_freq is not None:
+        return float(lo_freq)
+    if mode == 'quarter':
+        (e_lo, e_hi), (p_lo, p_hi) = ranges_deg['energy'], ranges_deg['pitch']
+        ref = Particle(ke=(e_lo + e_hi) / 2, startPos=np.zeros(3),
+                       pitchAngle=np.radians((p_lo + p_hi) / 2))
+        return SpectrumCalculator(trap, wg, ref).get_peak_frequency(0) - sample_rate / 4
+    if mode == 'centre':
+        return 0.5 * (plan['carrier_Hz'][0] + plan['carrier_Hz'][1])
+    raise ValueError(f"unknown LO mode {mode!r}")
+
+
+def check_carrier_in_band(plan, lo_freq, sample_rate):
+    """Raise if the carrier itself would alias; warn if it reaches the filter roll-off.
+
+    The anti-alias Butterworth (order 8, zero-phase) has its -6 dB point at
+    fs/2 and passes 0.5 dB less at about 0.42 fs."""
+    lo_c, hi_c = (f - lo_freq for f in plan['carrier_Hz'])
+    edge = max(abs(lo_c), abs(hi_c))
+    if edge >= sample_rate / 2:
+        raise ValueError(
+            f"downmixed carrier spans {lo_c / 1e6:.1f} to {hi_c / 1e6:.1f} MHz, outside the "
+            f"+-{sample_rate / 2e6:.0f} MHz band, so it would alias; use --lo-mode centre "
+            f"(range width {(hi_c - lo_c) / 1e6:.1f} MHz) or set --lo-freq")
+    if edge > 0.45 * sample_rate:
+        logging.warning("downmixed carrier reaches %.1f MHz, in the anti-alias filter roll-off",
+                        edge / 1e6)
+    return lo_c, hi_c
 
 
 def make_particle_generator(ranges, particle_seed, file_idx):
@@ -109,6 +232,13 @@ def main(argv=None):
     p.add_argument("--r-max", type=float, default=5e-3, help="Maximum start radius (m)")
     p.add_argument("--acq-time", type=float, default=40e-6, help="Seconds")
     p.add_argument("--max-order", type=int, default=8)
+    p.add_argument("--trap-depth", type=float, default=DEFAULT_TRAP_DEPTH_T,
+                   help="Trap depth (T): coil field at the trap centre, against the 1 T background")
+    p.add_argument("--lo-mode", choices=("quarter", "centre"), default="quarter",
+                   help="'quarter': reference electron at +fs/4 (default); "
+                        "'centre': carrier range centred in the band")
+    p.add_argument("--lo-freq", type=float, default=None,
+                   help="Explicit LO (Hz), overriding --lo-mode")
     p.add_argument("--phase-seed", type=int, required=True)
     p.add_argument("--particle-seed", type=int, required=True)
     p.add_argument("--device", default="cpu", help="cpu or cuda")
@@ -132,14 +262,24 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     os.makedirs(args.outdir, exist_ok=True)
 
-    # Physics, as in BatchGen.py
-    trap_depth, b0, r_coil = 4e-3, 1.0, 1.25e-2
-    trap = HarmonicField(radius=r_coil, current=2 * trap_depth * r_coil / sc.mu_0, background=b0)
-    wg = CircularWaveguide(radius=5e-3)
-    f_digitiser = 1e9
-    ref = Particle(ke=(args.energy_min + args.energy_max) / 2, startPos=np.zeros(3),
-                   pitchAngle=np.radians((args.pitch_min + args.pitch_max) / 2))
-    lo_freq = SpectrumCalculator(trap, wg, ref).get_peak_frequency(0) - f_digitiser / 4
+    # Physics, as in BatchGen.py, with the trap depth as an option
+    trap_depth, b0, r_coil = args.trap_depth, BACKGROUND_FIELD_T, COIL_RADIUS_M
+    try:
+        trap = build_trap(trap_depth)
+    except ValueError as exc:
+        p.error(str(exc))
+    wg = CircularWaveguide(radius=WAVEGUIDE_RADIUS_M)
+    f_digitiser = SAMPLE_RATE_HZ
+    ranges_deg = {'energy': (args.energy_min, args.energy_max),
+                  'pitch': (args.pitch_min, args.pitch_max), 'r': (0.0, args.r_max)}
+    # Fail before anything is written if the box is not trapped or the
+    # carrier would alias
+    try:
+        plan = frequency_plan(trap, wg, trap_depth, ranges_deg)
+        lo_freq = choose_lo(trap, wg, ranges_deg, plan, f_digitiser, args.lo_mode, args.lo_freq)
+        carrier_dm = check_carrier_in_band(plan, lo_freq, f_digitiser)
+    except ValueError as exc:
+        p.error(str(exc))
     sim_config = {'sample_rate': f_digitiser, 'lo_freq': lo_freq,
                   'acq_time': args.acq_time, 'max_order': args.max_order}
     ranges = {'energy': (args.energy_min, args.energy_max),
@@ -152,14 +292,24 @@ def main(argv=None):
               'css_commit': _git_commit(),
               'physics': {'trap_depth_T': trap_depth, 'background_field_T': b0,
                           'coil_radius_m': r_coil,
-                          'coil_current_A': 2 * trap_depth * r_coil / sc.mu_0,
-                          'waveguide_radius_m': 5e-3, 'sample_rate_Hz': f_digitiser,
+                          'coil_current_A': coil_current(trap_depth, r_coil),
+                          'waveguide_radius_m': WAVEGUIDE_RADIUS_M, 'sample_rate_Hz': f_digitiser,
+                          'min_trapped_pitch_deg': plan['min_trapped_pitch_deg'],
+                          'lo_mode': 'explicit' if args.lo_freq is not None else args.lo_mode,
+                          'carrier_range_Hz': list(plan['carrier_Hz']),
+                          'downmixed_carrier_range_Hz': list(carrier_dm),
+                          'axial_range_Hz': list(plan['axial_Hz']),
+                          'downmixed_label': 'signed, f - LO',
                           'chirp': 'physical (0.5 k t^2, gamma^3)',
                           'time_axis': 'arange / fs'}}
     cfg_path = os.path.join(args.outdir, f"run_config_{args.prefix}_{args.first_file:03d}.json")
     with open(cfg_path, "w") as f:
         json.dump(config, f, indent=2)
-    print(f"LO {lo_freq / 1e9:.6f} GHz, commit {config['css_commit'][:10]}, device {args.device}")
+    print(f"trap depth {trap_depth * 1e3:g} mT (pitch > {plan['min_trapped_pitch_deg']:.3f} deg "
+          f"trapped), LO {lo_freq / 1e9:.6f} GHz ({config['physics']['lo_mode']}), carrier "
+          f"{carrier_dm[0] / 1e6:.1f} to {carrier_dm[1] / 1e6:.1f} MHz, f_a "
+          f"{plan['axial_Hz'][0] / 1e6:.1f} to {plan['axial_Hz'][1] / 1e6:.1f} MHz, "
+          f"commit {config['css_commit'][:10]}, device {args.device}")
 
     t_start = time.time()
     total, dropped = 0, 0
