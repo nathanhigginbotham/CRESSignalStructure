@@ -4,8 +4,11 @@ benchmark_batched_generation.py
 Throughput and equivalence benchmark for CRES event generation.
 
 Three paths are timed on the same particles and phases, with the physics
-setup of BatchGen.py (HarmonicField R = 1.25 cm, 4 mT depth, B0 = 1 T,
-5 mm circular waveguide, 1 GHz sampling, LO = f_c(ref) - 250 MHz, max order 8):
+setup of BatchGen.py (HarmonicField R = 1.25 cm, B0 = 1 T, 5 mm circular
+waveguide, 1 GHz sampling, max order 8) and the trap depth, pitch range and
+LO convention of BatchGenFast.py (defaults: 4 mT, pitch 86.5-89.9 deg,
+LO = f_c(ref) - 250 MHz; --trap-depth 32e-3 --pitch-min 80 --lo-mode centre
+gates the broad-range geometry):
 
   original  SignalGenerator.generate_signal from a reference git commit
             (default 3cf55ca, before the physics caching), loaded from
@@ -62,6 +65,12 @@ def parse_args():
                     help="git commit for the original path, or 'none' to skip it")
     ap.add_argument("--threads", type=int, default=4, help="torch CPU threads")
     ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--trap-depth", type=float, default=4e-3, help="trap depth (T)")
+    ap.add_argument("--pitch-min", type=float, default=86.5, help="degrees")
+    ap.add_argument("--pitch-max", type=float, default=89.9,
+                    help="degrees; draws are capped at 89.9, where the physics is numerically safe")
+    ap.add_argument("--lo-mode", choices=("quarter", "centre"), default="quarter")
+    ap.add_argument("--lo-freq", type=float, default=None, help="explicit LO (Hz)")
     ap.add_argument("--json", default=None, help="write results to this JSON file")
     return ap.parse_args()
 
@@ -85,25 +94,38 @@ def load_original_package(commit, repo_root):
     return pkg, tmp
 
 
-def physics_setup(pkg):
-    """Field, waveguide and LO as in BatchGen.py, built from the given package."""
+def physics_setup(pkg, trap_depth, lo):
+    """Field and waveguide as in BatchGenFast.py, built from the given package."""
+    import BatchGenFast
     rf = importlib.import_module(pkg.__name__ + ".RealFields")
     cw = importlib.import_module(pkg.__name__ + ".CircularWaveguide")
-    pa = importlib.import_module(pkg.__name__ + ".Particle")
-    sp = importlib.import_module(pkg.__name__ + ".SpectrumCalculator")
-    r_coil, depth = 1.25e-2, 4e-3
-    trap = rf.HarmonicField(radius=r_coil, current=2 * depth * r_coil / sc.mu_0, background=1.0)
+    trap = BatchGenFast.build_trap(trap_depth, field_cls=rf.HarmonicField)
     wg = cw.CircularWaveguide(radius=5e-3)
-    ref = pa.Particle(ke=18550.0, startPos=np.zeros(3), pitchAngle=np.radians((86.5 + 89.9) / 2))
-    lo = float(sp.SpectrumCalculator(trap, wg, ref).get_peak_frequency(0) - 1e9 / 4)
     return trap, wg, lo
 
 
-def draw_particles(pkg, n, seed):
+def plan_lo(args):
+    """LO of the gated geometry, from BatchGenFast.py's checks and convention.
+
+    Computed once with the working tree and shared by every path, so the
+    paths differ only in the generator. Refuses an untrapped pitch range or
+    an aliasing carrier exactly as BatchGenFast.py does."""
+    import BatchGenFast
+    trap = BatchGenFast.build_trap(args.trap_depth)
+    wg = BatchGenFast.CircularWaveguide(radius=BatchGenFast.WAVEGUIDE_RADIUS_M)
+    ranges = {'energy': (18500.0, 18600.0), 'pitch': (args.pitch_min, args.pitch_max),
+              'r': (0.0, 5e-3)}
+    plan = BatchGenFast.frequency_plan(trap, wg, args.trap_depth, ranges)
+    lo = float(BatchGenFast.choose_lo(trap, wg, ranges, plan, 1e9, args.lo_mode, args.lo_freq))
+    BatchGenFast.check_carrier_in_band(plan, lo, 1e9)
+    return lo, plan
+
+
+def draw_particles(pkg, n, seed, pitch_min=86.5, pitch_max=89.9):
     pa = importlib.import_module(pkg.__name__ + ".Particle")
     rng = np.random.default_rng(seed)
     ke = rng.uniform(18500, 18600, n)
-    pitch = np.radians(rng.uniform(86.5, 89.9, n))
+    pitch = np.radians(rng.uniform(pitch_min, min(pitch_max, 89.9), n))
     r = np.sqrt(rng.uniform(0, 1, n)) * 5e-3
     th = rng.uniform(0, 2 * np.pi, n)
     phi_c, phi_a = rng.uniform(0, 2 * np.pi, n), rng.uniform(0, 2 * np.pi, n)
@@ -113,11 +135,11 @@ def draw_particles(pkg, n, seed):
     return parts, phi_c, phi_a
 
 
-def run_reference(pkg, parts, phi_c, phi_a, acq, n):
+def run_reference(pkg, parts, phi_c, phi_a, acq, n, trap_depth, lo):
     """Time SignalGenerator.generate_signal from `pkg`, one event at a time."""
     sg = importlib.import_module(pkg.__name__ + ".SignalGenerator")
     sp = importlib.import_module(pkg.__name__ + ".SpectrumCalculator")
-    trap, wg, lo = physics_setup(pkg)
+    trap, wg, lo = physics_setup(pkg, trap_depth, lo)
     sigs = []
     t0 = time.perf_counter()
     for i in range(n):
@@ -152,10 +174,15 @@ def main():
     except OSError:
         pass
 
+    lo, plan = plan_lo(args)
+    print(f"trap depth {args.trap_depth * 1e3:g} mT, pitch {args.pitch_min}-{args.pitch_max} deg, "
+          f"LO {lo / 1e9:.6f} GHz, carrier {(plan['carrier_Hz'][0] - lo) / 1e6:.1f} to "
+          f"{(plan['carrier_Hz'][1] - lo) / 1e6:.1f} MHz")
     orig_pkg, orig_tmp = load_original_package(args.original_commit, repo_root)
-    trap, wg, lo = physics_setup(css)
+    trap, wg, lo = physics_setup(css, args.trap_depth, lo)
     n_pool = max(args.n_events, args.n_ref_events)
-    parts, phi_c, phi_a = draw_particles(css, n_pool, args.seed)
+    pr = (args.pitch_min, args.pitch_max)
+    parts, phi_c, phi_a = draw_particles(css, n_pool, args.seed, *pr)
     n_ref = min(args.n_ref_events, n_pool)
     pool = mp.Pool(args.n_workers) if args.n_workers > 1 else None
     results = {"args": vars(args), "runs": []}
@@ -166,12 +193,13 @@ def main():
         row = {"acq_time": acq}
 
         if orig_pkg is not None:
-            o_parts, _, _ = draw_particles(orig_pkg, n_pool, args.seed)
-            dt, orig_sigs = run_reference(orig_pkg, o_parts, phi_c, phi_a, acq, n_ref)
+            o_parts, _, _ = draw_particles(orig_pkg, n_pool, args.seed, *pr)
+            dt, orig_sigs = run_reference(orig_pkg, o_parts, phi_c, phi_a, acq, n_ref,
+                                          args.trap_depth, lo)
             row["original_ev_per_s"] = n_ref / dt
             print(f"original ({args.original_commit}) : {n_ref / dt:8.2f} ev/s  ({dt / n_ref * 1e3:.1f} ms/event)")
 
-        dt, cached_sigs = run_reference(css, parts, phi_c, phi_a, acq, n_ref)
+        dt, cached_sigs = run_reference(css, parts, phi_c, phi_a, acq, n_ref, args.trap_depth, lo)
         row["cached_ev_per_s"] = n_ref / dt
         print(f"cached SignalGenerator : {n_ref / dt:8.2f} ev/s  ({dt / n_ref * 1e3:.1f} ms/event)")
         if orig_pkg is not None:

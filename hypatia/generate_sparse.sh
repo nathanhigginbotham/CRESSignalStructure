@@ -28,6 +28,13 @@
 # the batched CUDA records differ from SignalGenerator by more than 1e-10
 # relative L2); SKIP_GATE=1 skips it once it has passed on this commit.
 # Step 2 is a small sparse-vs-dense validation (SKIP_CHECK=1 skips it).
+# Both steps run at the geometry of the run: any --trap-depth, --pitch-min,
+# --pitch-max, --lo-mode or --lo-freq among the BatchGenFast.py arguments is
+# passed to them too, so a pass at 4 mT does not stand in for a 32 mT run.
+#
+# Broad range (32 mT trap, pitch 80-90 deg, carrier centred in the band):
+#   sbatch hypatia/generate_sparse.sh $HOME/data/broad/train --trap-depth 32e-3 \
+#       --pitch-min 80 --pitch-max 90 --lo-mode centre ...
 #
 # Splitting 1M events across jobs: every event is seeded by
 # [particle_seed, file_index, i] (phases likewise), so file f is the same
@@ -78,18 +85,32 @@ echo "Output: $OUTDIR"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 df -h "$OUTDIR" | tail -1
 
+# The physics options of the run, forwarded to the gate and the check
+PHYS_ARGS=()
+ARGV=("$@")
+for ((i = 0; i < ${#ARGV[@]}; i++)); do
+    case "${ARGV[i]}" in
+        --trap-depth|--pitch-min|--pitch-max|--lo-mode|--lo-freq)
+            PHYS_ARGS+=("${ARGV[i]}" "${ARGV[i + 1]}"); i=$((i + 1)) ;;
+        --trap-depth=*|--pitch-min=*|--pitch-max=*|--lo-mode=*|--lo-freq=*)
+            PHYS_ARGS+=("${ARGV[i]}") ;;
+    esac
+done
+echo "Physics options for the gate and check: ${PHYS_ARGS[*]:-(defaults)}"
+
 if [ "${SKIP_GATE:-0}" != "1" ]; then
     python scripts/benchmark_batched_generation.py --device cuda \
         --acq-times 40e-6 --batch-sizes 64 256 --n-events 512 --n-ref-events 8 \
         --n-workers "${WORKERS}" --threads 4 --phasors direct block \
-        --filter-backends torch scipy --json "hypatia/gensparse_gate_${SLURM_JOB_ID}.json"
+        --filter-backends torch scipy --json "hypatia/gensparse_gate_${SLURM_JOB_ID}.json" \
+        "${PHYS_ARGS[@]}"
 fi
 
 if [ "${SKIP_CHECK:-0}" != "1" ]; then
     # Sparse against dense on CUDA, in a scratch directory that is deleted after
     python scripts/check_sparse_generation.py --n-events 256 --device cuda \
         --workers "${WORKERS}" --batch-size 128 \
-        --json "hypatia/gensparse_check_${SLURM_JOB_ID}.json"
+        --json "hypatia/gensparse_check_${SLURM_JOB_ID}.json" -- "${PHYS_ARGS[@]}"
 fi
 
 python BatchGenFast.py --device cuda --workers "${WORKERS}" --batch-size 256 \
