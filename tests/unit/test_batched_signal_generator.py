@@ -139,7 +139,7 @@ def test_ensemble_writer_truth_labels_and_phases(setup, tmp_path):
             a = f['Data'][f'signal{i + 1}'].attrs
             f_mean = field.calc_omega_0(p) / (2 * np.pi)
             assert a['Mean cyclotron frequency [Hertz]'] == f_mean
-            assert a['Mean downmixed cyclotron frequency [Hertz]'] == abs(f_mean - lo)
+            assert a['Mean downmixed cyclotron frequency [Hertz]'] == f_mean - lo
             assert a['Axial frequency [Hertz]'] == field.calc_omega_axial(p) / (2 * np.pi)
             assert a['Cyclotron phase [rad]'] == phi_c[i]
             assert a['Axial phase [rad]'] == phi_a[i]

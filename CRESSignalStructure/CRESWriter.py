@@ -152,11 +152,15 @@ class CRESWriter:
             attrs['B_bkg [Tesla]'] = B_local
 
         attrs['Cyclotron frequency [Hertz]'] = f_cyc
-        attrs['Downmixed cyclotron frequency [Hertz]'] = abs(f_cyc - f_lo)
+        # Signed (f - LO): with the LO inside the carrier range (a wide trap)
+        # a carrier below the LO is negative, and its sign is what puts it in
+        # the right half of the complex spectrum. Identical to the old abs()
+        # whenever the LO is below the carrier, as in every earlier dataset.
+        attrs['Downmixed cyclotron frequency [Hertz]'] = f_cyc - f_lo
         if f_cyc_mean is None or f_axial is None:
             f_cyc_mean, f_axial = self._mean_freqs(particle)
         attrs['Mean cyclotron frequency [Hertz]'] = f_cyc_mean
-        attrs['Mean downmixed cyclotron frequency [Hertz]'] = abs(f_cyc_mean - f_lo)
+        attrs['Mean downmixed cyclotron frequency [Hertz]'] = f_cyc_mean - f_lo
         attrs['Axial frequency [Hertz]'] = f_axial
         if phi_c is not None:
             attrs['Cyclotron phase [rad]'] = phi_c
@@ -298,7 +302,7 @@ class CRESWriter:
             attrs['scatter_cyclotron_frequencies [Hertz]'] = np.array(
                 f_cyc_arr)
             attrs['scatter_downmixed_cyclotron_frequencies [Hertz]'] = \
-                np.abs(np.array(f_cyc_arr) - f_lo)
+                np.array(f_cyc_arr) - f_lo        # signed, as above
 
         logger.debug(
             "Wrote scattering event: n_scatters=%d, escaped=%s, "
