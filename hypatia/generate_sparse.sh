@@ -38,7 +38,7 @@
 #   for k in 0 1 2 3; do
 #     sbatch hypatia/generate_sparse.sh $HOME/data/sparse_1M/train \
 #         --first-file $((25 * k)) --files 25 --events 10000 --prefix train \
-#         --phase-seed 1010 --particle-seed 2010
+#         --phase-seed 1040 --particle-seed 2040   # never reuse the val (1010/2010) or test (1020/2020) seeds
 #   done
 #
 # Calibrate --time from the ev/s that the first job logs per file; a job
