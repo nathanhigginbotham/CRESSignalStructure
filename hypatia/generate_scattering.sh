@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=css_genscatter
-#SBATCH --partition=CLUSTER
+#SBATCH --partition=GPU
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
