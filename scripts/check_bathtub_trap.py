@@ -16,7 +16,8 @@ to one JSON report (and the field profile to a figure):
             88 and 89.5 deg, and how many sideband orders fall in the band
   sidebands fraction of signal power beyond order n (Parseval: the
             amplitudes of all orders sum to 1) at those pitches, a worst case
-            over a pitch scan, and the in-band fraction with the run's LO
+            over a pitch scan, and the fraction the anti-alias filter passes
+            (tones weighted by |H|^4) with each trap's run LO
   cost      physics and synthesis time per event against --max-order
   jitter    relative scatter of calc_omega_axial over a fine pitch scan
             (residual from a local cubic fit), both traps
@@ -126,11 +127,13 @@ def matched_background(args, wg):
             'residual_Hz': f - target}
 
 
-def run_plan(trap, wg, args):
-    """Frequency plan and LO of the run box, exactly as BatchGenFast.py builds them."""
+def run_plan(name, trap, wg, args):
+    """Frequency plan and LO of the run box, exactly as BatchGenFast.py builds
+    them (LO mode: --lo-mode, else the trap's BatchGenFast.py default)."""
     ranges = {'energy': (18500.0, 18600.0), 'pitch': (86.5, 90.0), 'r': (0.0, 5e-3)}
     plan = BGF.frequency_plan(trap, wg, args.trap_depth, ranges)
-    lo = float(BGF.choose_lo(trap, wg, ranges, plan, FS, args.lo_mode, None))
+    mode = args.lo_mode or BGF.TRAP_DEFAULTS[name]['lo_mode']
+    lo = float(BGF.choose_lo(trap, wg, ranges, plan, FS, mode, None))
     dm = BGF.check_carrier_in_band(plan, lo, FS)
     return plan, lo, dm
 
@@ -152,13 +155,17 @@ def section_tones(args, traps, wg, plans):
                              'z_max_m': trap.calc_z_max(particle(18550.0, pitch, r)),
                              'highest_upper_order_in_band': n_up,
                              'highest_lower_order_in_band': n_down})
-        res[name] = {'lo_Hz': lo, 'downmixed_carrier_range_Hz': list(dm),
+        res[name] = {'lo_Hz': lo, 'lo_mode': args.lo_mode or BGF.TRAP_DEFAULTS[name]['lo_mode'],
+                     'downmixed_carrier_range_Hz': list(dm),
                      'axial_range_Hz': list(plan['axial_Hz']),
                      'min_trapped_pitch_deg': plan['min_trapped_pitch_deg'], 'rows': rows}
     return res
 
 
 def section_sidebands(args, traps, wg, plans):
+    from scipy.signal import butter, sosfreqz
+    from CRESSignalStructure.SignalGenerator import FAST_SAMPLE_FACTOR, FILTER_ORDER
+    sos = butter(N=FILTER_ORDER, Wn=FS / 2, btype='low', output='sos', fs=FS * FAST_SAMPLE_FACTOR)
     orders = np.arange(-60, 61)
     cuts = (5, 8, 12, 16, 18, 20, 24, 28, 32)
     res = {}
@@ -174,13 +181,14 @@ def section_sidebands(args, traps, wg, plans):
                 beyond = {n: float(1.0 - P[np.abs(orders) <= n].sum() / P.sum()) for n in cuts}
                 for n in cuts:
                     worst[n] = max(worst[n], beyond[n])
-                if pitch in REPORT_PITCHES:
-                    in_band = np.abs(f - lo) < FS / 2
+                if pitch in REPORT_PITCHES or pitch == 86.5:
+                    _, h = sosfreqz(sos, worN=np.abs(f - lo), fs=FS * FAST_SAMPLE_FACTOR)
+                    passed = P * np.abs(h) ** 4
                     rows.append({'pitch_deg': float(pitch), 'r_m': r, 'parseval_sum': float(P.sum()),
                                  'fraction_beyond_order': {str(n): beyond[n] for n in cuts},
-                                 'fraction_in_band_all_orders': float(P[in_band].sum() / P.sum()),
-                                 'fraction_in_band_order_le_24':
-                                     float(P[in_band & (np.abs(orders) <= 24)].sum() / P.sum())})
+                                 'fraction_passed_all_orders': float(passed.sum() / P.sum()),
+                                 'fraction_passed_order_le_24':
+                                     float(passed[np.abs(orders) <= 24].sum() / P.sum())})
         res[name] = {'rows': rows,
                      'worst_fraction_beyond_order_pitch_scan':
                          {str(n): v for n, v in worst.items()},
@@ -294,7 +302,8 @@ def main():
     ap.add_argument("--coil-z", type=float, default=BGF.DEFAULT_COIL_Z_M)
     ap.add_argument("--background", type=float, default=BGF.BACKGROUND_FIELD_T,
                     help="bathtub background (T); the harmonic trap keeps 1 T")
-    ap.add_argument("--lo-mode", choices=("quarter", "centre"), default="quarter")
+    ap.add_argument("--lo-mode", choices=("quarter", "centre"), default=None,
+                    help="LO mode for both traps (default: each trap's BatchGenFast.py default)")
     ap.add_argument("--acq-time", type=float, default=40e-6)
     ap.add_argument("--max-order", type=int, default=24, help="order used by the drops section")
     ap.add_argument("--cost-events", type=int, default=16)
@@ -311,7 +320,7 @@ def main():
     report = {'args': vars(args), 'css_commit': BGF._git_commit()}
     plans = None
     if set(args.only) & {"tones", "sidebands", "cost", "drops"}:
-        plans = {k: run_plan(t, wg, args) for k, t in traps.items()}
+        plans = {k: run_plan(k, t, wg, args) for k, t in traps.items()}
     for sec in args.only:
         print(f"[{sec}]", flush=True)
         t0 = time.time()

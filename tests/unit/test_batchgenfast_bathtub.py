@@ -128,8 +128,43 @@ def test_trap_defaults(trap, order, mode):
     """Unset --max-order and --lo-mode follow the trap; explicit values win."""
     import argparse
     args = BatchGenFast.resolve_trap_defaults(
-        argparse.Namespace(trap=trap, max_order=None, lo_mode=None))
+        argparse.Namespace(trap=trap, max_order=None, lo_mode=None, coil_z=None))
     assert (args.max_order, args.lo_mode) == (order, mode)
+    assert args.coil_z == (0.05 if trap == "bathtub" else None)
     args = BatchGenFast.resolve_trap_defaults(
-        argparse.Namespace(trap=trap, max_order=5, lo_mode="quarter"))
+        argparse.Namespace(trap=trap, max_order=5, lo_mode="quarter", coil_z=0.03))
     assert (args.max_order, args.lo_mode) == (5, "quarter")
+
+
+@pytest.mark.parametrize("depth,background", [(50e-3, 1.0), (100e-3, 1.0), (32e-3, 0.5)])
+def test_deep_harmonic_plan_does_not_fail(depth, background):
+    """Deep harmonic traps keep the closed-form threshold without a spurious error."""
+    from CRESSignalStructure.CircularWaveguide import CircularWaveguide
+    trap = BatchGenFast.build_trap(depth, background=background)
+    p_min = BatchGenFast.min_trapped_pitch_deg(depth, background)
+    ranges = {'energy': (18500.0, 18600.0), 'pitch': (p_min + 0.5, 90.0), 'r': (0.0, 5e-3)}
+    plan = BatchGenFast.frequency_plan(trap, CircularWaveguide(radius=5e-3), depth, ranges)
+    assert plan['min_trapped_pitch_deg'] == p_min
+
+
+@pytest.mark.parametrize("coil_z", [0.004, 0.00625, 0.008])
+def test_bathtub_without_a_well_is_refused(coil_z):
+    with pytest.raises(ValueError, match="no flat-bottomed well"):
+        BatchGenFast.build_trap(4e-3, trap_type='bathtub', coil_z=coil_z)
+
+
+def test_coil_z_rejected_for_harmonic(tmp_path):
+    with pytest.raises(SystemExit):
+        BatchGenFast.main(COMMON + ["--outdir", str(tmp_path), "--coil-z", "0.03"])
+    assert not any(tmp_path.glob("*.h5"))
+
+
+def test_passband_fraction_recorded(tmp_path):
+    """The bathtub default (centre LO) passes nearly all the low-pitch power."""
+    BatchGenFast.main(["--files", "1", "--events", "2", "--acq-time", "4e-6",
+                       "--phase-seed", "11", "--particle-seed", "12", "--batch-size", "2",
+                       "--outdir", str(tmp_path), "--trap", "bathtub", "--background", "0.996"])
+    with open(tmp_path / "run_config_run_000.json") as fh:
+        cfg = json.load(fh)
+    assert cfg["max_order"] == 24 and cfg["lo_mode"] == "centre" and cfg["coil_z"] == 0.05
+    assert cfg["physics"]["passband_power_fraction_min_pitch"] > 0.99

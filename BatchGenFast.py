@@ -44,15 +44,19 @@ sets the harmonic background). The coils carry the same current, set so
 that the on-axis field rise from the flat centre to the coil walls,
 B_max - B_min, equals --trap-depth. The trapping threshold is computed from
 the on-axis extremes, sin^2(pitch) = B_min / B_max, for either trap.
-Bathtub files carry root attributes 'trap_type', 'coil_z [metres]' and
-'B_bkg [Tesla]' (harmonic files are byte-for-byte as before). A bathtub's
+Dense and FFT bathtub files carry root attributes 'trap_type',
+'coil_z [metres]', 'B_bkg [Tesla]', 'i_coil [Amps]' and 'trap_depth [Tesla]'
+(harmonic files are byte-for-byte as before; sparse output records the trap
+in its provenance config). A bathtub's
 axial frequency is low (about 14 MHz at 88 deg for coils at +-5 cm) and its
 trap long, so the Doppler phase spreads the power over many sideband
-orders (75 to 80 percent beyond order 8 at 86.6 and 88 deg, at most 2.4e-5
-beyond order 24). It therefore defaults to --max-order 24 and --lo-mode
-centre: with the carrier at +fs/4, the upper sidebands of low-pitch
-electrons pass the anti-alias filter edge and 35 to 40 percent of their
-power is lost. The harmonic defaults (8, quarter) are unchanged.
+orders (75 to 80 percent beyond order 8 at 86.6 and 88 deg; beyond order
+24, below 4e-5 down to 86.5 deg). It therefore defaults to --max-order 24
+and --lo-mode centre: with the carrier at +fs/4, the upper sidebands of
+low-pitch electrons cross the anti-alias filter edge and about 40 percent
+of their power is lost (centred, under 0.2 percent). The harmonic defaults
+(8, quarter) are unchanged. The run warns when the lowest pitch passes
+less than 95 percent of its sideband power through the filter.
 scripts/check_bathtub_trap.py reports these numbers.
 
 LO (--lo-mode): 'quarter' (default, unchanged) puts the reference electron
@@ -79,12 +83,14 @@ import h5py
 import numpy as np
 import scipy.constants as sc
 from scipy.optimize import minimize_scalar
+from scipy.signal import butter, sosfreqz
 
 from CRESSignalStructure.RealFields import BathtubField, HarmonicField
 from CRESSignalStructure.CircularWaveguide import CircularWaveguide
 from CRESSignalStructure.Particle import Particle
 from CRESSignalStructure.SpectrumCalculator import SpectrumCalculator
 from CRESSignalStructure.BatchedSignalGenerator import generate_ensemble_batched
+from CRESSignalStructure.SignalGenerator import FAST_SAMPLE_FACTOR, FILTER_ORDER
 from CRESSignalStructure.SparseSpectrum import SparseSpectrumWriter
 
 
@@ -103,24 +109,28 @@ def _git_commit() -> str:
 DEFAULT_TRAP_DEPTH_T = 4e-3
 BACKGROUND_FIELD_T = 1.0
 DEFAULT_COIL_Z_M = 0.05
-TRAP_TYPES = ('harmonic', 'bathtub')
-# Defaults that depend on the trap (see the module docstring)
-TRAP_DEFAULTS = {'harmonic': {'max_order': 8, 'lo_mode': 'quarter'},
-                 'bathtub': {'max_order': 24, 'lo_mode': 'centre'}}
-
-
-def resolve_trap_defaults(args):
-    """Fill --max-order and --lo-mode left unset with the trap's defaults."""
-    for key, value in TRAP_DEFAULTS[args.trap].items():
-        if getattr(args, key) is None:
-            setattr(args, key, value)
-    return args
 COIL_RADIUS_M = 1.25e-2
 WAVEGUIDE_RADIUS_M = 5e-3
 SAMPLE_RATE_HZ = 1e9
 # Pitch at which the frequency plan evaluates the top of the range: the
 # physics fails numerically within ~2e-3 deg of 90 (those events are dropped)
 PLAN_PITCH_MAX_DEG = 89.99
+TRAP_TYPES = ('harmonic', 'bathtub')
+# Defaults that depend on the trap (see the module docstring); --coil-z
+# applies to the bathtub only
+TRAP_DEFAULTS = {'harmonic': {'max_order': 8, 'lo_mode': 'quarter', 'coil_z': None},
+                 'bathtub': {'max_order': 24, 'lo_mode': 'centre', 'coil_z': DEFAULT_COIL_Z_M}}
+# Warn when the low-pitch corner of the box passes less than this fraction
+# of its sideband power through the anti-alias filter
+PASSBAND_WARN_FRACTION = 0.95
+
+
+def resolve_trap_defaults(args):
+    """Fill --max-order, --lo-mode and --coil-z left unset with the trap's defaults."""
+    for key, value in TRAP_DEFAULTS[args.trap].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
 
 
 def coil_current(trap_depth: float, r_coil: float = COIL_RADIUS_M) -> float:
@@ -158,6 +168,10 @@ def on_axis_extremes(trap, z_span: float | None = None) -> tuple[float, float]:
         res = minimize_scalar(lambda zz: sign * float(trap.evaluate_field_magnitude(0.0, 0.0, zz)),
                               bounds=(lo, hi), method='bounded', options={'xatol': 1e-12})
         out.append(min(b[i], res.fun) if sign > 0 else max(b[i], -res.fun))
+    if not hasattr(trap, 'coil1'):
+        # A single coil's field only recovers the background as z -> inf, so
+        # the background is the true B_max (the grid ends ~2e-6 d short)
+        out[1] = max(out[1], float(abs(trap.background[2])))
     return float(out[0]), float(out[1])
 
 
@@ -167,10 +181,18 @@ def bathtub_current(trap_depth: float, coil_z: float, background: float,
 
     With the background along +z and the same positive current in both
     coils, |B| on axis is background + I g(z) with g > 0, so the depth is
-    exactly linear in I: the depth of a 1 A trap fixes the current."""
+    exactly linear in I: the depth of a 1 A trap fixes the current. Coils
+    too close together (coil_z below about R / 2) merge into one bump with
+    no well at the centre, and are refused."""
     unit = BathtubField(radius=r_coil, current=1.0, Z1=-coil_z, Z2=coil_z,
                         background=np.array([0.0, 0.0, background]))
     b_min, b_max = on_axis_extremes(unit)
+    b_centre = float(unit.evaluate_field_magnitude(0.0, 0.0, 0.0))
+    # Require the minimum at the centre and walls rising by at least 10% of
+    # one coil's own central field (both per ampere)
+    if b_centre - b_min > 1e-12 * b_centre or b_max - b_min < 0.1 * sc.mu_0 / (2 * r_coil):
+        raise ValueError(f"coils at +-{coil_z} m (radius {r_coil} m) give no flat-bottomed "
+                         f"well on axis; increase --coil-z")
     return trap_depth / (b_max - b_min)
 
 
@@ -193,7 +215,7 @@ def build_trap(trap_depth: float, field_cls=None, trap_type: str = 'harmonic',
         field_cls = HarmonicField if field_cls is None else field_cls
         return field_cls(radius=COIL_RADIUS_M, current=coil_current(trap_depth),
                          background=background)
-    if not coil_z > 0.0:
+    if coil_z is None or not coil_z > 0.0:
         raise ValueError(f"bathtub coil half-separation must be positive, got {coil_z}")
     field_cls = BathtubField if field_cls is None else field_cls
     return field_cls(radius=COIL_RADIUS_M,
@@ -244,13 +266,12 @@ def frequency_plan(trap, wg, trap_depth, ranges_deg):
     b_min, b_max = on_axis_extremes(trap)
     p_numeric = float(np.degrees(np.arcsin(np.sqrt(b_min / b_max))))
     if isinstance(trap, HarmonicField):
-        # The closed form, as before; the numerical threshold (axis searched
-        # to 1 m, where the coil field is 8e-9 T) must agree with it
+        # The closed form, as before; the numerical threshold must agree
         b0 = float(abs(trap.background[2]))
         p_min_trap = min_trapped_pitch_deg(trap_depth, b0)
-        if abs(p_numeric - p_min_trap) > 1e-5:
-            raise AssertionError(f"numerical trapping threshold {p_numeric:.8f} deg disagrees "
-                                 f"with the harmonic closed form {p_min_trap:.8f} deg")
+        if abs(p_numeric - p_min_trap) > 1e-7:
+            raise ValueError(f"numerical trapping threshold {p_numeric:.9f} deg disagrees "
+                             f"with the harmonic closed form {p_min_trap:.9f} deg")
         need = f"depth needed: {b0 * np.cos(np.radians(p_lo))**2:.4g} T"
         pitches, radii = (p_lo, p_top), (r_lo, r_hi)
     else:
@@ -291,6 +312,21 @@ def choose_lo(trap, wg, ranges_deg, plan, sample_rate, mode, lo_freq=None):
     if mode == 'centre':
         return 0.5 * (plan['carrier_Hz'][0] + plan['carrier_Hz'][1])
     raise ValueError(f"unknown LO mode {mode!r}")
+
+
+def passband_fraction(trap, wg, ke, pitch_deg, r, lo_freq, sample_rate, max_order):
+    """Fraction of one electron's sideband power (orders up to max_order)
+    that the zero-phase anti-alias filter passes: each tone is weighted by
+    |H(f - LO)|^4, the power response of sosfiltfilt."""
+    p = Particle(ke=ke, startPos=np.array([r, 0.0, 0.0]), pitchAngle=np.radians(pitch_deg))
+    sc_ = SpectrumCalculator(trap, wg, p)
+    orders = np.arange(-max_order, max_order + 1)
+    power = np.abs(sc_.get_peak_amp(orders)) ** 2
+    sos = butter(N=FILTER_ORDER, Wn=sample_rate / 2, btype='low', output='sos',
+                 fs=sample_rate * FAST_SAMPLE_FACTOR)
+    _, h = sosfreqz(sos, worN=np.abs(sc_.get_peak_frequency(orders) - lo_freq),
+                    fs=sample_rate * FAST_SAMPLE_FACTOR)
+    return float(np.sum(power * np.abs(h) ** 4) / np.sum(power))
 
 
 def check_carrier_in_band(plan, lo_freq, sample_rate):
@@ -364,8 +400,9 @@ def main(argv=None):
                    help="'harmonic': one coil at z = 0 (default); 'bathtub': coils at +-coil-z")
     p.add_argument("--trap-depth", type=float, default=DEFAULT_TRAP_DEPTH_T,
                    help="Trap depth (T): on-axis B_max - B_min (harmonic: the coil field at the centre)")
-    p.add_argument("--coil-z", type=float, default=DEFAULT_COIL_Z_M,
-                   help="Bathtub coil half-separation (m): coils at -coil-z and +coil-z")
+    p.add_argument("--coil-z", type=float, default=None,
+                   help="Bathtub coil half-separation (m): coils at -coil-z and +coil-z "
+                        f"(default {DEFAULT_COIL_Z_M})")
     p.add_argument("--background", type=float, default=BACKGROUND_FIELD_T,
                    help="Uniform background field (T)")
     p.add_argument("--lo-mode", choices=("quarter", "centre"), default=None,
@@ -389,7 +426,10 @@ def main(argv=None):
                    help="Keep bins above this fraction of the per-component noise std at --sparse-tmin")
     p.add_argument("--sparse-tref", type=float, default=10.0,
                    help="Reference temperature (K) of the stored normalised spectrum")
-    args = resolve_trap_defaults(p.parse_args(argv))
+    args = p.parse_args(argv)
+    if args.trap == 'harmonic' and args.coil_z is not None:
+        p.error("--coil-z applies to --trap bathtub only")
+    args = resolve_trap_defaults(args)
     if args.also_dense and not args.sparse:
         p.error("--also-dense needs --sparse")
 
@@ -414,6 +454,15 @@ def main(argv=None):
         carrier_dm = check_carrier_in_band(plan, lo_freq, f_digitiser)
     except ValueError as exc:
         p.error(str(exc))
+    # Low-pitch electrons spread their power furthest in frequency: warn if
+    # the LO and --max-order leave much of it outside the filter passband
+    passband = min(passband_fraction(trap, wg, ke, args.pitch_min, r, lo_freq, f_digitiser,
+                                     args.max_order)
+                   for ke, r in ((args.energy_min, 0.0), (args.energy_max, args.r_max)))
+    if passband < PASSBAND_WARN_FRACTION:
+        logging.warning("at pitch %.3f deg only %.1f%% of the sideband power (orders up to %d) "
+                        "passes the anti-alias filter with this LO; consider --lo-mode centre",
+                        args.pitch_min, 100 * passband, args.max_order)
     sim_config = {'sample_rate': f_digitiser, 'lo_freq': lo_freq,
                   'acq_time': args.acq_time, 'max_order': args.max_order}
     ranges = {'energy': (args.energy_min, args.energy_max),
@@ -434,6 +483,7 @@ def main(argv=None):
                           'carrier_range_Hz': list(plan['carrier_Hz']),
                           'downmixed_carrier_range_Hz': list(carrier_dm),
                           'axial_range_Hz': list(plan['axial_Hz']),
+                          'passband_power_fraction_min_pitch': passband,
                           'downmixed_label': 'signed, f - LO',
                           'chirp': 'physical (0.5 k t^2, gamma^3)',
                           'time_axis': 'arange / fs'}}

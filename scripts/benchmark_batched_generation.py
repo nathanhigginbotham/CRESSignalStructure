@@ -74,7 +74,8 @@ def parse_args():
                     help="default: BatchGenFast.py's for the trap (quarter harmonic, centre bathtub)")
     ap.add_argument("--lo-freq", type=float, default=None, help="explicit LO (Hz)")
     ap.add_argument("--trap", choices=("harmonic", "bathtub"), default="harmonic")
-    ap.add_argument("--coil-z", type=float, default=0.05, help="bathtub coil half-separation (m)")
+    ap.add_argument("--coil-z", type=float, default=None,
+                    help="bathtub coil half-separation (m), default 0.05")
     ap.add_argument("--background", type=float, default=1.0, help="background field (T)")
     ap.add_argument("--max-order", type=int, default=None,
                     help="maximum sideband order (default: BatchGenFast.py's, 8 harmonic, 24 bathtub)")
