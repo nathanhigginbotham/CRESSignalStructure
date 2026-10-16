@@ -25,6 +25,15 @@
 # worktree ~/Github/CSS_perf). Each 10K-event 40 us file is about 3.2 GB;
 # check free space on /home before large runs (it is shared).
 # SKIP_GATE=1 skips step 1 once it has passed on this commit.
+#
+# The gate runs at the geometry of the run: any --trap, --coil-z,
+# --background, --max-order, --trap-depth, --pitch-min, --pitch-max,
+# --lo-mode or --lo-freq among the BatchGenFast.py arguments is forwarded to
+# it. Bathtub example (coils at +-5 cm, carrier centred, 24 sideband orders):
+#
+#   sbatch hypatia/generate_fast.sh --trap bathtub --background 0.99604746401776 \
+#       --lo-mode centre --max-order 24 --files 1 --events 10000 --prefix val_10K \
+#       --phase-seed 1110 --particle-seed 2110 --outdir $HOME/data/bathtub_v1/val
 
 set -eo pipefail
 
@@ -49,11 +58,25 @@ echo "Job ${SLURM_JOB_ID} on $(hostname), GPU ${CUDA_VISIBLE_DEVICES}, commit $(
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 df -h "$HOME" | tail -1
 
+# The physics options of the run, forwarded to the gate
+PHYS_ARGS=()
+ARGV=("$@")
+for ((i = 0; i < ${#ARGV[@]}; i++)); do
+    case "${ARGV[i]}" in
+        --trap|--coil-z|--background|--max-order|--trap-depth|--pitch-min|--pitch-max|--lo-mode|--lo-freq)
+            PHYS_ARGS+=("${ARGV[i]}" "${ARGV[i + 1]}"); i=$((i + 1)) ;;
+        --trap=*|--coil-z=*|--background=*|--max-order=*|--trap-depth=*|--pitch-min=*|--pitch-max=*|--lo-mode=*|--lo-freq=*)
+            PHYS_ARGS+=("${ARGV[i]}") ;;
+    esac
+done
+echo "Physics options for the gate: ${PHYS_ARGS[*]:-(defaults)}"
+
 if [ "${SKIP_GATE:-0}" != "1" ]; then
     python scripts/benchmark_batched_generation.py --device cuda \
         --acq-times 40e-6 --batch-sizes 64 256 --n-events 512 --n-ref-events 8 \
         --n-workers "${WORKERS}" --threads 4 --phasors direct block \
-        --filter-backends torch scipy --json "hypatia/genfast_gate_${SLURM_JOB_ID}.json"
+        --filter-backends torch scipy --json "hypatia/genfast_gate_${SLURM_JOB_ID}.json" \
+        "${PHYS_ARGS[@]}"
 fi
 
 python BatchGenFast.py --device cuda --workers "${WORKERS}" --batch-size 256 "$@"

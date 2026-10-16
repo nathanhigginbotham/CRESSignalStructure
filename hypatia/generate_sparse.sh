@@ -28,8 +28,9 @@
 # the batched CUDA records differ from SignalGenerator by more than 1e-10
 # relative L2); SKIP_GATE=1 skips it once it has passed on this commit.
 # Step 2 is a small sparse-vs-dense validation (SKIP_CHECK=1 skips it).
-# Both steps run at the geometry of the run: any --trap-depth, --pitch-min,
-# --pitch-max, --lo-mode or --lo-freq among the BatchGenFast.py arguments is
+# Both steps run at the geometry of the run: any --trap, --coil-z,
+# --background, --max-order, --trap-depth, --pitch-min, --pitch-max,
+# --lo-mode or --lo-freq among the BatchGenFast.py arguments is
 # passed to them too, so a pass at 4 mT does not stand in for a 32 mT run.
 #
 # Broad range (32 mT trap, pitch 80-90 deg, carrier centred in the band):
@@ -90,9 +91,9 @@ PHYS_ARGS=()
 ARGV=("$@")
 for ((i = 0; i < ${#ARGV[@]}; i++)); do
     case "${ARGV[i]}" in
-        --trap-depth|--pitch-min|--pitch-max|--lo-mode|--lo-freq)
+        --trap|--coil-z|--background|--max-order|--trap-depth|--pitch-min|--pitch-max|--lo-mode|--lo-freq)
             PHYS_ARGS+=("${ARGV[i]}" "${ARGV[i + 1]}"); i=$((i + 1)) ;;
-        --trap-depth=*|--pitch-min=*|--pitch-max=*|--lo-mode=*|--lo-freq=*)
+        --trap=*|--coil-z=*|--background=*|--max-order=*|--trap-depth=*|--pitch-min=*|--pitch-max=*|--lo-mode=*|--lo-freq=*)
             PHYS_ARGS+=("${ARGV[i]}") ;;
     esac
 done
