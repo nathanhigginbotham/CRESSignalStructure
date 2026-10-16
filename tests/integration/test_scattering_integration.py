@@ -170,3 +170,46 @@ class TestScatteringEnsemble:
             assert 'scatter_cyclotron_frequencies [Hertz]' in attrs
             assert 'scatter_downmixed_cyclotron_frequencies [Hertz]' in attrs
             assert len(attrs['scatter_times [seconds]']) == n_scatters
+            n_states = len(attrs['scatter_energies [eV]'])
+            for key in ('scatter_mean_cyclotron_frequencies [Hertz]',
+                        'scatter_mean_downmixed_cyclotron_frequencies [Hertz]',
+                        'scatter_axial_frequencies [Hertz]'):
+                assert len(attrs[key]) == n_states
+
+    def test_ensemble_phases_order_and_reproducibility(self, tmp_path):
+        trap = HarmonicTrap(B0, L0)
+        wg = CircularWaveguide(WG_RADIUS)
+        gas = GasModel([(EnergyLossCrossSection(1e-18, 5.0), 1e19)])
+        sim_config = {
+            'sample_rate': SAMPLE_RATE,
+            'lo_freq': 26.5e9,
+            'max_event_time': 5e-6,
+            'max_order': MAX_ORDER,
+        }
+        phases = [(0.3, 1.1), (2.0, 0.7), (4.5, 5.9)]
+
+        def run(path, use_mp):
+            generate_scattering_ensemble(
+                output_file=str(path), n_events=3,
+                particle_generator=lambda i: Electron(KE + i, POS, PITCH),
+                trap=trap, waveguide=wg, gas_model=gas, sim_config=sim_config,
+                use_multiprocessing=use_mp, verbose=False, seed=7,
+                phase_generator=lambda i: phases[i], processes=2)
+
+        run(tmp_path / "a.h5", False)
+        run(tmp_path / "b.h5", True)
+        with h5py.File(tmp_path / "a.h5", 'r') as fa, \
+                h5py.File(tmp_path / "b.h5", 'r') as fb:
+            for i in range(3):
+                a = fa['Data'][f'signal{i + 1}']
+                b = fb['Data'][f'signal{i + 1}']
+                # Written in index order, with the requested phases
+                assert a.attrs['Event index'] == i
+                assert a.attrs['Energy [eV]'] == pytest.approx(KE + i)
+                assert a.attrs['Cyclotron phase [rad]'] == phases[i][0]
+                assert a.attrs['Axial phase [rad]'] == phases[i][1]
+                # Same seed, same scatters and waveform with or without a pool
+                np.testing.assert_array_equal(
+                    a.attrs['scatter_times [seconds]'],
+                    b.attrs['scatter_times [seconds]'])
+                np.testing.assert_array_equal(a[:], b[:])

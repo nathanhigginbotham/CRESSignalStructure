@@ -222,12 +222,12 @@ def generate_uniform_ensemble(output_file: str,
 
 def _worker_generate_scattering_event(args: tuple[int, Particle, BaseTrap | BaseField, 
                                       CircularWaveguide, GasModel, dict, 
-                                      np.random.SeedSequence]) -> tuple:
+                                      np.random.SeedSequence, float, float]) -> tuple:
     """
     Worker function for scattering events. Generates a single event with
     gas scattering and computes FFT.
     """
-    index, particle, trap, waveguide, gas_model, config, seed = args
+    index, particle, trap, waveguide, gas_model, config, seed, phi_c, phi_a = args
 
     try:
         rng = np.random.default_rng(seed)
@@ -242,7 +242,9 @@ def _worker_generate_scattering_event(args: tuple[int, Particle, BaseTrap | Base
         result = sim.simulate(
             particle=particle,
             max_order=config['max_order'],
-            rng=rng
+            rng=rng,
+            phi_c=phi_c,
+            phi_a=phi_a
         )
 
         fft_complex = np.asarray(scipy.fft.fft(result.signal, norm='forward'))
@@ -250,7 +252,7 @@ def _worker_generate_scattering_event(args: tuple[int, Particle, BaseTrap | Base
         freqs = scipy.fft.fftfreq(len(result.signal), dt)
         fft_power = np.abs(fft_complex)**2
 
-        return (index, result, freqs, fft_power)
+        return (index, result, freqs, fft_power, phi_c, phi_a)
 
     except Exception as e:
         return (index, e)
@@ -266,9 +268,10 @@ def _process_scattering_results(results_iterator: Iterator[Any], n_events: int,
             logger.warning("Event %d failed: %s", result[0], result[1])
             continue
 
-        idx, scat_result, freqs, fft_power = result
+        idx, scat_result, freqs, fft_power, phi_c, phi_a = result
 
-        writer.write_scattering_event(scat_result)
+        writer.write_scattering_event(scat_result, phi_c=phi_c, phi_a=phi_a,
+                                      event_index=idx)
 
         if fft_writer:
             fft_writer.write_event(
@@ -291,9 +294,15 @@ def generate_scattering_ensemble(output_file: str,
                                  fft_output_file: str | None = None,
                                  use_multiprocessing: bool = True,
                                  verbose: bool = True,
-                                 seed: int | None = None) -> None:
+                                 seed: int | None = None,
+                                 phase_generator: Callable[[int], tuple[float, float]] | None = None,
+                                 processes: int | None = None) -> None:
     """
     Generate an ensemble of scattering events.
+
+    Events are written in index order (failed events are skipped), each
+    with its index as the 'Event index' attribute, so a run is reproducible
+    for a given seed.
 
     Parameters
     ----------
@@ -317,6 +326,15 @@ def generate_scattering_ensemble(output_file: str,
         Whether to use multiprocessing (default True)
     verbose : bool
         Whether to print progress (default True)
+    seed : int, optional
+        Seed for the scatter draws (time to scatter, energy loss, angle).
+        None draws fresh entropy, so the run is not reproducible.
+    phase_generator : callable, optional
+        Function(index) -> (phi_c, phi_a), the initial cyclotron and axial
+        phases in radians. Default: both zero for every event.
+    processes : int, optional
+        Worker processes (default: every CPU on the machine, which on a
+        shared node is more than the job was allocated).
     """
     ss = np.random.SeedSequence(seed)
     child_seeds = ss.spawn(n_events)
@@ -324,8 +342,10 @@ def generate_scattering_ensemble(output_file: str,
     worker_args = []
     for i in range(n_events):
         p = particle_generator(i)
+        phi_c, phi_a = phase_generator(i) if phase_generator else (0.0, 0.0)
         worker_args.append(
-            (i, p, trap, waveguide, gas_model, sim_config, child_seeds[i]))
+            (i, p, trap, waveguide, gas_model, sim_config, child_seeds[i],
+             phi_c, phi_a))
 
     with ExitStack() as stack:
         writer = stack.enter_context(CRESWriter(output_file))
@@ -339,7 +359,7 @@ def generate_scattering_ensemble(output_file: str,
         start_time = time.time()
 
         if use_multiprocessing:
-            num_cores = mp.cpu_count()
+            num_cores = processes or mp.cpu_count()
             if verbose:
                 logger.info(
                     "Starting generation of %d scattering events on %d cores...",
@@ -347,7 +367,8 @@ def generate_scattering_ensemble(output_file: str,
                 )
 
             with mp.Pool(processes=num_cores) as pool:
-                results_iterator = pool.imap_unordered(
+                # Ordered, so signalN follows the event index
+                results_iterator = pool.imap(
                     _worker_generate_scattering_event,
                     worker_args, chunksize=10)
                 _process_scattering_results(

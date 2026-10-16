@@ -247,7 +247,8 @@ class CRESWriter:
             particle.get_pitch_angle(), len(signal_array)
         )
 
-    def write_scattering_event(self, result):
+    def write_scattering_event(self, result, phi_c: float = None,
+                               phi_a: float = None, event_index: int = None):
         """
         Write a scattering event including scatter metadata.
 
@@ -258,18 +259,27 @@ class CRESWriter:
         ----------
         result : ScatteringResult
             Output from ScatteringSimulator.simulate()
+        phi_c, phi_a : float, optional
+            Initial cyclotron and axial phases, stored as for write_event
+        event_index : int, optional
+            Index of the event in its generator stream, stored as
+            'Event index' (signalN skips failed events, so it can differ)
         """
         if self.file is None or self._config is None or self._trap is None:
             raise RuntimeError("CRESWriter must be used within a 'with' " \
                                "statement and set_global_config must be called first.")
 
         initial_particle = result.particles[0]
-        self.write_event(initial_particle, result.times, result.signal)
+        self.write_event(initial_particle, result.times, result.signal,
+                         phi_c=phi_c, phi_a=phi_a)
 
         # Add scattering metadata to the dataset just written
         sig_name = f"signal{self.current_index}"
         dset = self.file['Data'][sig_name]
         attrs = dset.attrs
+
+        if event_index is not None:
+            attrs['Event index'] = event_index
 
         attrs['n_scatters'] = len(result.scatter_times)
         attrs['escaped'] = result.escaped
@@ -303,6 +313,16 @@ class CRESWriter:
                 f_cyc_arr)
             attrs['scatter_downmixed_cyclotron_frequencies [Hertz]'] = \
                 np.array(f_cyc_arr) - f_lo        # signed, as above
+
+            # Orbit-averaged carrier and axial frequency per segment: these
+            # are what the spectrum shows, and both step at each scatter.
+            # result.particles holds one state per segment (n_scatters + 1,
+            # or n_scatters when the last scatter ejected the electron).
+            mean_axial = np.array([self._mean_freqs(p) for p in result.particles])
+            attrs['scatter_mean_cyclotron_frequencies [Hertz]'] = mean_axial[:, 0]
+            attrs['scatter_mean_downmixed_cyclotron_frequencies [Hertz]'] = \
+                mean_axial[:, 0] - f_lo           # signed, as above
+            attrs['scatter_axial_frequencies [Hertz]'] = mean_axial[:, 1]
 
         logger.debug(
             "Wrote scattering event: n_scatters=%d, escaped=%s, "
